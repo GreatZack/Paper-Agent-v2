@@ -1,0 +1,25 @@
+# Paper-Agent-v2 模型配置
+# 所有节点统一使用 default-model，不再区分 search-model / reading-model
+
+default-model:
+  model-provider: deepseek
+  model: deepseek-chat
+  # api_key 可以直接填写，也可以引用 .env 中的环境变量名
+  api_key: ${DEEPSEEK_API_KEY}
+  base_url: https://api.deepseek.com/v1
+
+# 搜索节点配置（预留字段，当前未全部启用）
+search_node:
+  # 是否使用 LLM 生成查询条件
+  use_llm: true
+  # 是否下载 PDF
+  download_pdf: true
+  # PDF 下载目录
+  pdf_download_dir: data/papers
+  # 默认时间范围策略（预留，当前未启用）
+  default_time_range:
+    enabled: false
+    lookback_years: 5
+  # 默认排序策略（预留，当前未启用）
+  # 可选值: relevance | submitted_date
+  default_sort_by: relevance

@@ -1,0 +1,24 @@
+# Paper-Agent-v2 模型配置模板
+# 复制本文件为 config.yaml 后填入真实值
+
+# 默认模型，当 search-model / reading-model 等未配置时作为兜底
+default-model:
+  model-provider: siliconflow
+  model: Qwen/Qwen3-32B
+  # api_key 可以直接填写，也可以引用 .env 中的环境变量名
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
+
+# 搜索节点专用模型（可选，未配置时回退到 default-model）
+search-model:
+  model-provider: siliconflow
+  model: Qwen/Qwen3-32B
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
+
+# 阅读节点专用模型（可选）
+reading-model:
+  model-provider: siliconflow
+  model: Qwen/Qwen3-32B
+  api_key: ${SILICONFLOW_API_KEY}
+  base_url: https://api.siliconflow.cn/v1
