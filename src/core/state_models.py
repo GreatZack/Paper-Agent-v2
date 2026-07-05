@@ -120,19 +120,78 @@ class ParseRule(BaseModel):
     required: bool = Field(default=False, description="是否必填")
 
 
+class ParsedPaper(BaseModel):
+    """清洗归一化后的单篇论文信息"""
+
+    paper_id: str = Field(default="", description="论文唯一标识")
+    title: str = Field(default="", description="论文标题")
+    authors: str = Field(default="", description="作者列表（逗号分隔）")
+    core_problem: str = Field(default="", description="核心问题")
+    key_methodology: str = Field(default="", description="关键方法")
+    main_results: str = Field(default="", description="主要结果")
+    limitations: str = Field(default="", description="局限性")
+    contributions: List[str] = Field(default_factory=list, description="贡献列表")
+    tags: List[str] = Field(default_factory=list, description="分类标签")
+
+
+class ComparisonPoint(BaseModel):
+    """跨论文对比数据点"""
+
+    topic: str = Field(default="", description="对比主题，如 'CIFAR-10 Top-1 Acc'")
+    comparable: bool = Field(default=False, description="是否可直接对比")
+    entries: Dict[str, str] = Field(default_factory=dict, description="paper_id → 数值/描述")
+    note: Optional[str] = Field(default=None, description="不可比时的说明")
+
+
+class DiscrepancyNote(BaseModel):
+    """论文间的矛盾点"""
+
+    topic: str = Field(default="", description="冲突主题")
+    paper_a_id: str = Field(default="", description="论文A的ID")
+    paper_a_claim: str = Field(default="", description="论文A的结论")
+    paper_b_id: str = Field(default="", description="论文B的ID")
+    paper_b_claim: str = Field(default="", description="论文B的结论")
+
+
 class ParseInput(BaseModel):
     """解析节点输入"""
 
     content: List[KeyInformation] = Field(default_factory=list, description="待解析内容")
+    paper_meta: Dict[str, SearchResult] = Field(
+        default_factory=dict,
+        description="paper_id → SearchResult，提供 title/authors/pdf_path 等元信息",
+    )
     parse_rules: List[ParseRule] = Field(default_factory=list, description="解析规则")
 
 
 class ParseOutput(BaseModel):
     """解析节点输出"""
 
-    structured_data: Dict[str, Any] = Field(default_factory=dict, description="结构化数据")
+    papers: Dict[str, ParsedPaper] = Field(
+        default_factory=dict,
+        description="清洗后的论文数据，按 paper_id 索引",
+    )
+    raw_extractions: Dict[str, KeyInformation] = Field(
+        default_factory=dict,
+        description="原始 KeyInformation 备份，供下游回查",
+    )
+    taxonomy: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="方法分类 → 论文 ID 列表",
+    )
+    comparison_points: List[ComparisonPoint] = Field(
+        default_factory=list,
+        description="跨论文可对比的数据点",
+    )
+    discrepancies: List[DiscrepancyNote] = Field(
+        default_factory=list,
+        description="论文间的矛盾或结果差异",
+    )
+    coverage: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="每个维度被哪些论文覆盖，如 {'core_problem': ['id1', 'id2']}",
+    )
     status: str = Field(default="pending", description="解析状态")
-    unmatched_items: List[str] = Field(default_factory=list, description="未匹配项说明")
 
 
 # ==================== 撰写节点数据模型 ====================

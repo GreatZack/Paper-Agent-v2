@@ -41,7 +41,15 @@ async def test_full_workflow_with_mocked_search():
         mock_parse.return_value = type(
             "ParseOutput",
             (),
-            {"structured_data": {}, "status": "completed", "unmatched_items": []},
+            {
+                "papers": {},
+                "raw_extractions": {},
+                "taxonomy": {},
+                "comparison_points": [],
+                "discrepancies": [],
+                "coverage": {},
+                "status": "completed",
+            },
         )()
         mock_write.return_value = type(
             "WriteOutput",

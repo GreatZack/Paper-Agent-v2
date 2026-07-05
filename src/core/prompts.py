@@ -27,6 +27,73 @@ read_agent_prompt = """
 """
 
 
+parse_taxonomy_prompt = """
+你是一个学术论文分析方法分类的助手。你的任务是对一批学术论文进行方法分类。
+
+输入是每篇论文的标题和方法描述。请阅读所有论文，找出它们之间的共性和差异，
+设计合理的分类方案，把每篇论文归入最合适的类别。
+
+输出严格按以下 JSON 格式：
+{
+  "taxonomy": {
+    "类别名称": ["paper_id1", "paper_id2"],
+    "类别名称2": ["paper_id3", "paper_id4"]
+  },
+  "paper_tags": {
+    "paper_id1": ["标签1", "标签2"],
+    "paper_id2": ["标签1"]
+  }
+}
+
+要求：
+- 分类要有区分度，能帮助读者理解不同方法的差异
+- 一篇论文可归入多个类别（如果确实跨越多个方向）
+- paper_tags 是更细粒度的标签，用于后续检索和引用
+- 类别数量和粒度由数据本身决定，不要硬凑
+- 使用中文输出类别名和标签
+"""
+
+
+parse_comparison_prompt = """
+你是一个学术论文结果对比分析助手。你的任务是对一批论文的实验结果做跨论文对比。
+
+输入是每篇论文的标题和主要实验结果。请提取可对比的数据点。
+
+输出严格按以下 JSON 格式：
+{
+  "comparison_points": [
+    {
+      "topic": "对比主题，如 'CIFAR-10 Top-1 Acc'",
+      "comparable": true,
+      "entries": {"paper_id1": "92.3%", "paper_id2": "91.7%"},
+      "note": "实验设置一致，可直接对比"
+    },
+    {
+      "topic": "对比主题，如推理速度",
+      "comparable": false,
+      "entries": {"paper_id1": "100ms", "paper_id2": "未报告"},
+      "note": "论文2 未报告该指标，无法对比"
+    }
+  ],
+  "discrepancies": [
+    {
+      "topic": "冲突主题",
+      "paper_a_id": "id1",
+      "paper_a_claim": "方法A在X上取得SOTA",
+      "paper_b_id": "id2",
+      "paper_b_claim": "方法B在X上报告的结果比A高2%"
+    }
+  ]
+}
+
+要求：
+- 仅当数据点在同一个数据集、同一个评估指标下时标记 comparable=true
+- 不同数据集或不同指标的值，标记 comparable=false 并在 note 中说明原因
+- discrepancies 仅在发现同一问题有相反结论时才填写，不要编造
+- 不确定的字段留空（注意 JSON 字段不能为 undefined，而是不输出该字段），不要猜测
+"""
+
+
 search_agent_prompt = """
 你是一名专业的 arXiv 论文检索助手。请根据用户的自然语言查询需求，提取并生成符合 arXiv 搜索语法的检索条件。
 

@@ -52,7 +52,13 @@ async def write_node(state: State) -> State:
         node = WriteNode(current_state.config.get("write_node", {}))
 
         write_input = WriteInput(
-            structured_data=current_state.parse_output.structured_data,
+            structured_data={
+                "papers": current_state.parse_output.papers,
+                "taxonomy": current_state.parse_output.taxonomy,
+                "comparison_points": [p.model_dump() for p in current_state.parse_output.comparison_points],
+                "discrepancies": [d.model_dump() for d in current_state.parse_output.discrepancies],
+                "coverage": current_state.parse_output.coverage,
+            },
             template=current_state.config.get("write_template", "# Report\n\n{structured_data}"),
             style_hints={"language": "zh", "tone": "academic"},
         )

@@ -38,7 +38,10 @@ async def main():
     print(f"  current_step: {final_state.current_step}")
     print(f"  search_output.total_count: {final_state.search_output.total_count}")
     print(f"  read_output.key_info count: {len(final_state.read_output.key_info)}")
-    print(f"  parse_output.structured_data: {final_state.parse_output.structured_data}")
+    print(f"  parse_output.papers count: {len(final_state.parse_output.papers)}")
+    print(f"  parse_output.taxonomy: {list(final_state.parse_output.taxonomy.keys())}")
+    print(f"  parse_output.comparison_points: {len(final_state.parse_output.comparison_points)}")
+    print(f"  parse_output.discrepancies: {len(final_state.parse_output.discrepancies)}")
     print(f"  write_output.generated_text: {final_state.write_output.generated_text[:80]}...")
 
     print("\n搜索到的论文列表:")
