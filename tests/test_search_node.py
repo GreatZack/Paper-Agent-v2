@@ -15,7 +15,7 @@ from src.core.state_models import (
     SearchScope,
     State,
 )
-from src.nodes.search_node import SearchNode, SearchQuery, parse_search_query, search_node
+from src.nodes.search_node import SearchNode, search_node
 
 
 @pytest.fixture
@@ -49,6 +49,7 @@ def mock_search_agent():
 async def test_search_node_process_without_llm(sample_papers):
     node = SearchNode(config={"use_llm": False})
     node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
+    node._filter_relevant_papers = AsyncMock(side_effect=lambda papers, *a, **kw: (papers, []))
 
     input_data = SearchInput(
         query_keywords=["ROS2", "automated driving"],
@@ -63,25 +64,24 @@ async def test_search_node_process_without_llm(sample_papers):
     assert output.results[0].paper_id == "2411.11607v2"
     assert output.results[0].pdf_url == "http://arxiv.org/pdf/2411.11607v2"
     node.paper_searcher.search_papers.assert_awaited_once_with(
-        querys=["ROS2", "automated driving"],
+        query='(all:"ROS2" AND all:"automated driving")',
         max_results=5,
         sort_by=arxiv.SortCriterion.SubmittedDate,
         sort_order=arxiv.SortOrder.Descending,
-        start_date=None,
-        end_date=None,
     )
 
 
 @pytest.mark.asyncio
-async def test_search_node_process_with_llm_generated_queries(sample_papers):
-    generated = SearchQuery(querys=["LLM", "autonomous driving"], start_date="2023-01-01", end_date="2023-12-31")
+async def test_search_node_process_with_llm_generated_query(sample_papers):
+    """LLM 返回完整查询表达式，验证透传。"""
     mock_agent = MagicMock()
     mock_response = MagicMock()
-    mock_response.messages = [MagicMock(content=generated)]
+    mock_response.messages = [MagicMock(content='(all:"LLM" AND all:"autonomous driving") AND submittedDate:[20230101 TO 20231231]')]
     mock_agent.run = AsyncMock(return_value=mock_response)
 
     node = SearchNode(config={"use_llm": True})
     node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
+    node._filter_relevant_papers = AsyncMock(side_effect=lambda papers, *a, **kw: (papers, []))
 
     with patch("src.nodes.search_node.get_search_agent", return_value=mock_agent):
         input_data = SearchInput(
@@ -92,22 +92,43 @@ async def test_search_node_process_with_llm_generated_queries(sample_papers):
         output = await node.process(input_data)
 
     assert output.total_count == 1
-    assert output.metadata["querys"] == ["LLM", "autonomous driving"]
-    assert output.metadata["start_date"] == "2023-01-01"
-    assert output.metadata["end_date"] == "2023-12-31"
+    # 验证 metadata 中记录了 LLM 生成的完整查询
+    assert 'all:"LLM"' in output.metadata["arxiv_query"]
+    assert 'all:"autonomous driving"' in output.metadata["arxiv_query"]
     node.paper_searcher.search_papers.assert_awaited_once_with(
-        querys=["LLM", "autonomous driving"],
+        query='(all:"LLM" AND all:"autonomous driving") AND submittedDate:[20230101 TO 20231231]',
         max_results=5,
-        sort_by=arxiv.SortCriterion.Relevance,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
         sort_order=arxiv.SortOrder.Descending,
-        start_date="2023-01-01",
-        end_date="2023-12-31",
     )
 
 
 @pytest.mark.asyncio
-async def test_search_node_process_llm_fallback_to_keywords(sample_papers):
-    node = SearchNode(config={"use_llm": True})
+async def test_search_node_with_scope_date_uses_relevance_sort(sample_papers):
+    """SearchScope 中指定了 start_date 时，排序使用 Relevance。"""
+    node = SearchNode(config={"use_llm": False})
+    node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
+    node._filter_relevant_papers = AsyncMock(side_effect=lambda papers, *a, **kw: (papers, []))
+
+    input_data = SearchInput(
+        query_keywords=["LLM"],
+        search_scope=SearchScope(max_results=5, start_date="2023-01-01"),
+        user_request="搜索大模型",
+    )
+    await node.process(input_data)
+
+    node.paper_searcher.search_papers.assert_awaited_once_with(
+        query='(all:"LLM")',
+        max_results=5,
+        sort_by=arxiv.SortCriterion.Relevance,
+        sort_order=arxiv.SortOrder.Descending,
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_node_process_llm_agent_unavailable_raises(sample_papers):
+    """LLM Agent 不可用时，重试耗尽后报错（不做降级）。"""
+    node = SearchNode(config={"use_llm": True, "query_retry_limit": 2})
     node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
 
     with patch("src.nodes.search_node.get_search_agent", return_value=None):
@@ -116,10 +137,59 @@ async def test_search_node_process_llm_fallback_to_keywords(sample_papers):
             search_scope=SearchScope(max_results=5),
             user_request="帮我搜索相关内容",
         )
+        with pytest.raises(ValueError, match="LLM 搜索 Agent 初始化失败"):
+            await node.process(input_data)
+
+
+@pytest.mark.asyncio
+async def test_search_node_process_llm_invalid_query_all_retries_exhausted(sample_papers):
+    """LLM 持续返回无效查询时，重试耗尽后报错。"""
+    mock_agent = MagicMock()
+    mock_response = MagicMock()
+    mock_response.messages = [MagicMock(content="invalid query (unbalanced")]  # 括号不平衡
+    mock_agent.run = AsyncMock(return_value=mock_response)
+
+    node = SearchNode(config={"use_llm": True, "query_retry_limit": 2})
+    node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
+
+    with patch("src.nodes.search_node.get_search_agent", return_value=mock_agent):
+        input_data = SearchInput(
+            query_keywords=["fallback"],
+            search_scope=SearchScope(max_results=5),
+            user_request="帮我搜索相关内容",
+        )
+        with pytest.raises(ValueError, match="LLM 无法生成有效的查询表达式"):
+            await node.process(input_data)
+
+    # 验证 LLM 确实被调用了 query_retry_limit 次
+    assert mock_agent.run.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_search_node_process_llm_retry_success(sample_papers):
+    """LLM 前几次返回无效查询，最后一次正常，验证重试机制生效。"""
+    mock_agent = MagicMock()
+    mock_agent.run = AsyncMock(side_effect=[
+        MagicMock(messages=[MagicMock(content="bad query (unbalanced")]),
+        MagicMock(messages=[MagicMock(content="another bad (query")]),
+        MagicMock(messages=[MagicMock(content='(all:"LLM" AND all:"autonomous driving")')]),
+    ])
+
+    node = SearchNode(config={"use_llm": True, "query_retry_limit": 3})
+    node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
+    node._filter_relevant_papers = AsyncMock(side_effect=lambda papers, *a, **kw: (papers, []))
+
+    with patch("src.nodes.search_node.get_search_agent", return_value=mock_agent):
+        input_data = SearchInput(
+            query_keywords=["default"],
+            search_scope=SearchScope(max_results=5),
+            user_request="帮我搜索大模型在自动驾驶中的应用",
+        )
         output = await node.process(input_data)
 
     assert output.total_count == 1
-    assert output.metadata["querys"] == ["fallback keyword"]
+    assert 'all:"LLM"' in output.metadata["arxiv_query"]
+    assert mock_agent.run.await_count == 3  # 前 2 次失败，第 3 次成功
 
 
 @pytest.mark.asyncio
@@ -224,40 +294,79 @@ async def test_search_node_langgraph_adapter_frontend_mode(sample_papers):
     assert "共找到 1 条结果" in messages[1].data
 
 
-def test_parse_search_query():
-    s = "querys = ['LLM', 'autonomous driving']\nstart_date = '2023-01-01'\nend_date = '2023-12-31'"
-    query = parse_search_query(s)
-    assert query.querys == ["LLM", "autonomous driving"]
-    assert query.start_date == "2023-01-01"
-    assert query.end_date == "2023-12-31"
+def test_validate_query():
+    """验证查询表达式校验函数。"""
+    # 合法查询
+    assert SearchNode._validate_query('(all:"LLM" AND all:"autonomous driving")') is True
+    assert SearchNode._validate_query('ti:"GPT" OR abs:"self-driving"') is True
+    assert SearchNode._validate_query('(all:"A" OR all:"B") AND (all:"C" OR all:"D")') is True
+
+    # 非法查询
+    assert SearchNode._validate_query('') is False
+    assert SearchNode._validate_query('  ') is False
+    assert SearchNode._validate_query('((unbalanced') is False  # 括号不平衡
+    assert SearchNode._validate_query('unbalanced)') is False  # 括号负深度
+    assert SearchNode._validate_query('unknown_field:test') is False  # 不允许的字段
 
 
-def test_parse_search_query_invalid_list():
-    s = "querys = [invalid\nstart_date = '2023-01-01'"
-    query = parse_search_query(s)
-    assert query.querys == []
-    assert query.start_date == "2023-01-01"
-    assert query.end_date is None
+@pytest.mark.asyncio
+async def test_filter_relevant_papers_returns_discarded():
+    """验证 _filter_relevant_papers 返回 (kept, discarded)，discarded 包含被丢弃论文信息。"""
+    papers = [
+        {"paper_id": "001", "title": "Paper A", "summary": "A"},
+        {"paper_id": "002", "title": "Paper B", "summary": "B"},
+        {"paper_id": "003", "title": "Paper C", "summary": "C"},
+        {"paper_id": "004", "title": "Paper D", "summary": "D"},
+        {"paper_id": "005", "title": "Paper E", "summary": "E"},
+    ]
+
+    node = SearchNode(config={"use_llm": False})
+
+    mock_response = AsyncMock()
+    mock_response.messages = [MagicMock(content="[0, 2, 4]")]
+    mock_agent = MagicMock()
+    mock_agent.run = AsyncMock(return_value=mock_response)
+
+    with patch("src.nodes.search_node.AssistantAgent", return_value=mock_agent):
+        with patch("src.nodes.search_node.create_search_model_client") as mock_client:
+            mock_client.return_value = MagicMock()
+            kept, discarded = await node._filter_relevant_papers(
+                papers, "test request", ["test"]
+            )
+
+    assert len(kept) == 3
+    assert kept[0]["paper_id"] == "001"
+    assert kept[1]["paper_id"] == "003"
+    assert kept[2]["paper_id"] == "005"
+    assert len(discarded) == 2
+    assert discarded[0] == {"title": "Paper B", "paper_id": "002", "index": 1}
+    assert discarded[1] == {"title": "Paper D", "paper_id": "004", "index": 3}
 
 
-def test_parse_search_query_none_dates():
-    """验证 LLM 输出 None 或空字符串时统一转为 None。"""
-    s = "querys = ['LLM']\nstart_date = None\nend_date = ''"
-    query = parse_search_query(s)
-    assert query.querys == ["LLM"]
-    assert query.start_date is None
-    assert query.end_date is None
+@pytest.mark.asyncio
+async def test_filter_relevant_papers_discarded_empty_when_parse_fails():
+    """LLM 返回无法解析的内容时，全部保留，discarded 为空。"""
+    papers = [
+        {"paper_id": "001", "title": "Paper A", "summary": "A"},
+        {"paper_id": "002", "title": "Paper B", "summary": "B"},
+    ]
 
+    node = SearchNode(config={"use_llm": False})
 
-def test_search_node_normalize_and_validate_dates():
-    """验证空字符串归一化与日期顺序自动修正。"""
-    assert SearchNode._normalize_date("  ") is None
-    assert SearchNode._normalize_date("none") is None
-    assert SearchNode._normalize_date("2023-01-01") == "2023-01-01"
+    mock_response = AsyncMock()
+    mock_response.messages = [MagicMock(content="无法解析的格式")]
+    mock_agent = MagicMock()
+    mock_agent.run = AsyncMock(return_value=mock_response)
 
-    start, end = SearchNode._validate_date_order("2023-12-31", "2023-01-01")
-    assert start == "2023-01-01"
-    assert end == "2023-12-31"
+    with patch("src.nodes.search_node.AssistantAgent", return_value=mock_agent):
+        with patch("src.nodes.search_node.create_search_model_client") as mock_client:
+            mock_client.return_value = MagicMock()
+            kept, discarded = await node._filter_relevant_papers(
+                papers, "test request", ["test"]
+            )
+
+    assert len(kept) == 2  # 全部保留
+    assert discarded == []  # 丢弃记录为空
 
 
 def test_to_search_result():
@@ -285,6 +394,7 @@ async def test_search_node_response_speed(sample_papers):
 
     node = SearchNode(config={"use_llm": False})
     node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
+    node._filter_relevant_papers = AsyncMock(side_effect=lambda papers, *a, **kw: (papers, []))
     input_data = SearchInput(
         query_keywords=["speed test"],
         search_scope=SearchScope(max_results=5),

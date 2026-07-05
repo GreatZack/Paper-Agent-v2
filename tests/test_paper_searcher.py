@@ -87,7 +87,7 @@ async def test_search_papers_success(searcher):
     fake_client = _make_mock_client([fake_result])
 
     with patch("src.tasks.paper_search.arxiv.Client", return_value=fake_client):
-        papers = await searcher.search_papers(querys=["ROS2", "automated driving"], max_results=5)
+        papers = await searcher.search_papers(query='(all:"ROS2" AND all:"automated driving")', max_results=5)
 
     assert len(papers) == 1
     assert papers[0]["paper_id"] == "2411.11607v2"
@@ -101,10 +101,8 @@ async def test_search_papers_with_date_range(searcher):
 
     with patch("src.tasks.paper_search.arxiv.Client", return_value=fake_client) as mock_client_cls:
         papers = await searcher.search_papers(
-            querys=["automated driving"],
+            query='all:"automated driving" AND submittedDate:[20230101 TO 20231231]',
             max_results=10,
-            start_date="2023-01-01",
-            end_date="2023-12-31",
         )
 
     assert len(papers) == 1
@@ -117,7 +115,7 @@ async def test_search_papers_empty_results(searcher):
     fake_client = _make_mock_client([])
 
     with patch("src.tasks.paper_search.arxiv.Client", return_value=fake_client):
-        papers = await searcher.search_papers(querys=["nonexistent topic"], max_results=10)
+        papers = await searcher.search_papers(query='all:"nonexistent topic"', max_results=10)
 
     assert papers == []
 
@@ -125,7 +123,7 @@ async def test_search_papers_empty_results(searcher):
 @pytest.mark.asyncio
 async def test_search_papers_search_object_failure(searcher):
     with patch("src.tasks.paper_search.arxiv.Search", side_effect=Exception("arxiv error")):
-        papers = await searcher.search_papers(querys=["test"], max_results=10)
+        papers = await searcher.search_papers(query='all:"test"', max_results=10)
     assert papers == []
 
 

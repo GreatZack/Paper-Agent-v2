@@ -18,57 +18,32 @@ class PaperSearcher:
 
     async def search_papers(
         self,
-        querys: List[str],
+        query: str,
         max_results: int = 50,
         sort_by: arxiv.SortCriterion = arxiv.SortCriterion.Relevance,
         sort_order: arxiv.SortOrder = arxiv.SortOrder.Descending,
-        start_date: Optional[Union[str, datetime]] = None,
-        end_date: Optional[Union[str, datetime]] = None,
     ) -> List[Dict[str, Any]]:
-        """搜索 arXiv 论文。
+        """使用完整 arXiv 查询表达式搜索论文。
 
         Args:
-            querys: 搜索关键词列表。
+            query: 完整的 arXiv 查询表达式，如 '(all:"LLM" AND all:"autonomous driving")'
             max_results: 最大返回结果数量。
             sort_by: 排序方式。
             sort_order: 排序顺序。
-            start_date: 开始日期，字符串(YYYY-MM-DD)或 datetime 对象。
-            end_date: 结束日期，字符串(YYYY-MM-DD)或 datetime 对象。
 
         Returns:
             论文信息字典列表。
         """
         try:
-            if not querys:
-                logger.warning("搜索关键词列表为空，跳过 arXiv 搜索")
+            if not query or not query.strip():
+                logger.warning("查询表达式为空，跳过 arXiv 搜索")
                 return []
 
-            def _term(q: str) -> str:
-                q = q.replace("\\", "\\\\").replace('"', '\\"')
-                return f'all:"{q}"'
-
-            search_query = "(" + " OR ".join(_term(q) for q in querys) + ")"
-
-            if start_date or end_date:
-                start_str = self._format_date(start_date) if start_date else "190001010000"
-                end_str = (
-                    self._format_date(end_date, end_of_day=True)
-                    if end_date
-                    else datetime.now(timezone.utc).strftime("%Y%m%d2359")
-                )
-                if start_str > end_str:
-                    logger.warning(
-                        f"开始日期 {start_date} 晚于结束日期 {end_date}，已自动交换"
-                    )
-                    start_str, end_str = end_str, start_str
-                date_filter = f"submittedDate:[{start_str} TO {end_str}]"
-                search_query += f" AND {date_filter}"
-
-            logger.info(f"开始搜索论文: query='{search_query}', max_results={max_results}, sort_by={sort_by}")
+            logger.info(f"开始搜索论文: query='{query}', max_results={max_results}, sort_by={sort_by}")
 
             try:
                 search = arxiv.Search(
-                    query=search_query,
+                    query=query,
                     max_results=max_results,
                     sort_by=sort_by,
                     sort_order=sort_order,
@@ -93,15 +68,20 @@ class PaperSearcher:
     ) -> List[Dict[str, Any]]:
         """按主题搜索最近的论文。"""
         logger.info(f"按主题搜索论文: topic='{topic}', limit={limit}, recent_days={recent_days}")
-        start_date = None
+        escaped_topic = topic.replace("\\", "\\\\").replace('"', '\\"')
+        query = f'all:"{escaped_topic}"'
+
         if recent_days:
             start_date = datetime.now() - timedelta(days=recent_days)
+            start_str = self._format_date(start_date)
+            end_str = datetime.now(timezone.utc).strftime("%Y%m%d2359")
+            query += f" AND submittedDate:[{start_str} TO {end_str}]"
+
         return await self.search_papers(
-            querys=[topic],
+            query=query,
             max_results=limit,
             sort_by=arxiv.SortCriterion.SubmittedDate,
             sort_order=arxiv.SortOrder.Descending,
-            start_date=start_date,
         )
 
     def format_papers_list(self, search_results) -> List[Dict[str, Any]]:
@@ -118,17 +98,7 @@ class PaperSearcher:
         download_dir: str,
         timeout: float = 60.0,
     ) -> Optional[str]:
-        """异步下载 PDF 到本地目录。
-
-        Args:
-            pdf_url: PDF 下载链接。
-            paper_id: 论文唯一标识，用于生成文件名。
-            download_dir: 本地保存目录。
-            timeout: 下载超时时间（秒）。
-
-        Returns:
-            下载成功返回本地文件路径，失败返回 None。
-        """
+        """异步下载 PDF 到本地目录。"""
         if not pdf_url:
             logger.warning(f"论文 {paper_id} 没有 pdf_url，跳过下载")
             return None
@@ -160,9 +130,10 @@ class PaperSearcher:
     ) -> List[Dict[str, Any]]:
         """按作者搜索论文。"""
         logger.info(f"按作者搜索论文: author='{author_name}', limit={limit}")
-        query = f"au:{author_name}"
+        escaped_name = author_name.replace("\\", "\\\\").replace('"', '\\"')
+        query = f'au:"{escaped_name}"'
         return await self.search_papers(
-            querys=[query],
+            query=query,
             max_results=limit,
             sort_by=arxiv.SortCriterion.SubmittedDate,
             sort_order=arxiv.SortOrder.Descending,

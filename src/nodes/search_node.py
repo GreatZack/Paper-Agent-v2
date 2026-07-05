@@ -1,4 +1,4 @@
-import ast
+import json
 import re
 import textwrap
 from datetime import datetime
@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 
 import arxiv
 from autogen_agentchat.agents import AssistantAgent
-from pydantic import BaseModel, Field
 
 from src.core.model_client import create_search_model_client
 from src.core.prompts import search_agent_prompt
@@ -25,14 +24,8 @@ from src.utils.log_utils import setup_logger
 
 logger = setup_logger(__name__)
 
-
-class SearchQuery(BaseModel):
-    """查询条件类，存储用户查询需求。"""
-
-    querys: List[str] = Field(default_factory=list, description="查询条件列表")
-    start_date: Optional[str] = Field(default=None, description="开始时间, 格式: YYYY-MM-DD")
-    end_date: Optional[str] = Field(default=None, description="结束时间, 格式: YYYY-MM-DD")
-
+# 允许的 arXiv 字段前缀白名单（小写，用于 query 验证）
+_ALLOWED_FIELD_PREFIXES = {"all:", "ti:", "abs:", "au:", "submitteddate:", "submitted_date:"}
 
 _search_agent: Optional[AssistantAgent] = None
 
@@ -56,29 +49,6 @@ def get_search_agent() -> Optional[AssistantAgent]:
         return None
 
 
-def parse_search_query(s: str) -> SearchQuery:
-    """将搜索模型传回的字符串转为 SearchQuery 对象。"""
-    querys_match = re.search(r"querys\s*=\s*(\[[^\]]*\])", s)
-    start_match = re.search(r"start_date\s*=\s*(?:'([^']*)'|None)", s)
-    end_match = re.search(r"end_date\s*=\s*(?:'([^']*)'|None)", s)
-
-    querys: List[str] = []
-    if querys_match:
-        try:
-            querys = ast.literal_eval(querys_match.group(1))
-        except Exception:
-            querys = []
-
-    def _normalize_date(value: Optional[str]) -> Optional[str]:
-        """将空字符串统一转为 None。"""
-        return value.strip() if value and value.strip() and value.strip().lower() != "none" else None
-
-    start_date = _normalize_date(start_match.group(1)) if start_match else None
-    end_date = _normalize_date(end_match.group(1)) if end_match else None
-
-    return SearchQuery(querys=querys, start_date=start_date, end_date=end_date)
-
-
 class SearchNode(BaseNode[SearchInput, SearchOutput]):
     """搜索节点：根据查询条件检索相关文档。"""
 
@@ -94,44 +64,107 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         self.paper_searcher = PaperSearcher()
 
     @staticmethod
-    def _normalize_date(value: Optional[str]) -> Optional[str]:
-        """将空字符串统一转为 None。"""
-        if value is None:
-            return None
-        stripped = value.strip()
-        return stripped if stripped and stripped.lower() != "none" else None
+    def _validate_query(query: str) -> bool:
+        """验证 LLM 生成的 arXiv 查询表达式是否合法。
 
-    @staticmethod
-    def _validate_date_order(start_date: Optional[str], end_date: Optional[str]) -> tuple:
-        """校验并修正日期顺序。"""
-        if start_date and end_date and start_date > end_date:
-            logger.warning(f"开始日期 {start_date} 晚于结束日期 {end_date}，已自动交换")
-            return end_date, start_date
-        return start_date, end_date
+        检查项：
+        - 括号平衡
+        - 字段前缀在白名单内
+        - 无可疑注入字符
+        """
+        if not query or not query.strip():
+            return False
+
+        # 括号平衡检查
+        depth = 0
+        for ch in query:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if depth < 0:
+                return False
+        if depth != 0:
+            return False
+
+        # 提取并验证字段前缀
+        prefixes = re.findall(r'(?<![a-zA-Z])[a-zA-Z]+:', query)
+        for p in prefixes:
+            if p.lower() not in _ALLOWED_FIELD_PREFIXES:
+                logger.warning(f"查询表达式中包含不允许的字段前缀: {p}")
+                return False
+
+        # 禁止控制字符（arXiv API 会拒绝）
+        if re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', query):
+            return False
+
+        return True
 
     async def process(self, input_data: SearchInput) -> SearchOutput:
-        """执行搜索：LLM 生成查询条件 -> 调用 arxiv 搜索 -> 返回结构化结果。"""
-        self.logger.info(f"[{self.name}] query_keywords={input_data.query_keywords}")
+        """执行搜索：LLM 生成完整查询表达式 -> 调用 arxiv 搜索 -> 返回结构化结果。
+
+        LLM 生成的查询会经过验证，无效则带反馈重试（最多 query_retry_limit 次）。
+        若 LLM 多次失败后仍无法生成有效查询，直接报错，不做降级。
+        """
+        self.logger.info(f"[{self.name}] user_request={input_data.user_request}")
 
         query_keywords = list(input_data.query_keywords or [])
-        start_date = self._normalize_date(input_data.search_scope.start_date)
-        end_date = self._normalize_date(input_data.search_scope.end_date)
+        start_date = input_data.search_scope.start_date
+        end_date = input_data.search_scope.end_date
         max_results = input_data.search_scope.max_results
+        max_retries = self.config.get("query_retry_limit", 3)
 
+        # ── 阶段 1：用 LLM 生成完整查询表达式（带验证 + 重试） ──
+        arxiv_query: Optional[str] = None
         if input_data.user_request and self.use_llm:
-            generated_query = await self._generate_search_queries(input_data.user_request)
-            if generated_query and generated_query.querys:
-                query_keywords = generated_query.querys
-                start_date = self._normalize_date(generated_query.start_date) or start_date
-                end_date = self._normalize_date(generated_query.end_date) or end_date
-                self.logger.info(f"[{self.name}] LLM generated queries: {query_keywords}")
+            agent = get_search_agent()
+            if agent is None:
+                raise ValueError(
+                    "LLM 搜索 Agent 初始化失败，无法生成查询表达式。"
+                    "请检查 search-model 配置或设置 use_llm=False 使用关键词搜索。"
+                )
+            last_error: Optional[str] = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    generated = await self._generate_search_query(
+                        input_data.user_request, feedback=last_error
+                    )
+                    if generated and self._validate_query(generated):
+                        arxiv_query = generated
+                        self.logger.info(
+                            f"[{self.name}] LLM 生成查询 (第{attempt}次): {arxiv_query}"
+                        )
+                        break
+                    elif generated:
+                        last_error = f"生成的查询表达式不合法: {generated}"
+                        self.logger.warning(
+                            f"[{self.name}] {last_error}，重试 ({attempt}/{max_retries})"
+                        )
+                    else:
+                        last_error = "LLM 返回了空查询"
+                        self.logger.warning(
+                            f"[{self.name}] {last_error}，重试 ({attempt}/{max_retries})"
+                        )
+                except Exception as e:
+                    last_error = str(e)
+                    self.logger.warning(
+                        f"[{self.name}] LLM 查询生成异常: {e}，重试 ({attempt}/{max_retries})"
+                    )
 
-        start_date, end_date = self._validate_date_order(start_date, end_date)
+            if arxiv_query is None:
+                raise ValueError(
+                    f"LLM 无法生成有效的查询表达式（重试 {max_retries} 次后放弃）: {last_error}"
+                )
 
-        if not query_keywords:
-            raise ValueError("没有可用的搜索关键词")
+        # ── 阶段 2：LLM 不可用时（use_llm=False 或 agent 初始化失败） ──
+        else:
+            if not query_keywords:
+                raise ValueError("没有可用的搜索关键词")
+            escaped = [q.replace("\\", "\\\\").replace('"', '\\"') for q in query_keywords]
+            arxiv_query = "(" + " AND ".join(f'all:"{q}"' for q in escaped) + ")"
+            self.logger.info(f"[{self.name}] 关键词拼装查询: {arxiv_query}")
 
-        # 用户未指定开始时间时，按提交时间倒序获取最新论文；否则按相关性排序
+        # ── 阶段 3：排序策略 ──
         if start_date is None:
             sort_by = arxiv.SortCriterion.SubmittedDate
             sort_order = arxiv.SortOrder.Descending
@@ -139,15 +172,20 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
             sort_by = arxiv.SortCriterion.Relevance
             sort_order = arxiv.SortOrder.Descending
 
+        # ── 阶段 4：执行搜索 ──
         papers = await self.paper_searcher.search_papers(
-            querys=query_keywords,
+            query=arxiv_query,
             max_results=max_results,
             sort_by=sort_by,
             sort_order=sort_order,
-            start_date=start_date,
-            end_date=end_date,
         )
 
+        # ── 阶段 5：相关性过滤（纵深防御） ──
+        papers, discarded = await self._filter_relevant_papers(
+            papers, input_data.user_request or "", query_keywords
+        )
+
+        # ── 阶段 6：转换结果并下载 PDF ──
         results = []
         for paper in papers:
             result = self._to_search_result(paper)
@@ -164,14 +202,24 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
             total_count=len(results),
             status="completed",
             metadata={
+                "arxiv_query": arxiv_query,
                 "querys": query_keywords,
                 "start_date": start_date,
                 "end_date": end_date,
+                "filtered_kept": len(papers),
+                "filtered_discarded": discarded,
             },
         )
 
-    async def _generate_search_queries(self, user_request: str) -> Optional[SearchQuery]:
-        """使用 LLM Agent 根据用户请求生成检索查询条件。"""
+    async def _generate_search_query(
+        self, user_request: str, feedback: Optional[str] = None
+    ) -> Optional[str]:
+        """使用 LLM Agent 根据用户请求生成完整 arXiv 查询表达式。
+
+        Args:
+            user_request: 用户的原始需求。
+            feedback: 前一次生成失败的原因，用于引导 LLM 自我修正。
+        """
         agent = get_search_agent()
         if agent is None:
             return None
@@ -181,16 +229,16 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
                 f"""\
                 当前日期：{current_date}
 
-                请根据用户查询需求，生成检索查询条件。
+                请根据用户查询需求，生成 arXiv 检索用的 query 表达式。
                 用户查询需求：{user_request}
                 """
             )
+            if feedback:
+                prompt += f"\n前一次生成的查询无效，原因：{feedback}\n请修正后重新生成，只输出 query 本身。"
             response = await agent.run(task=prompt)
             content = response.messages[-1].content
-            if isinstance(content, SearchQuery):
-                return content
             if isinstance(content, str):
-                return parse_search_query(content)
+                return content.strip()
             return None
         except Exception as e:
             self.logger.warning(f"LLM 查询生成失败: {e}")
@@ -214,6 +262,81 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
                 "published_year": paper.get("published"),
             },
         )
+
+    async def _filter_relevant_papers(
+        self,
+        papers: List[Dict[str, Any]],
+        user_request: str,
+        query_keywords: List[str],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """使用 LLM 批量过滤论文，只保留与用户请求严格相关的论文。
+
+        宁可少保留，也不混入无关论文。如果 LLM 调用失败则保留全部。
+
+        Returns:
+            (kept, discarded) 二元组。kept 为保留论文列表，discarded 为丢弃论文摘要列表
+            （每项含 title/paper_id/index）。LLM 异常时 discarded 为空列表。
+        """
+        if not papers or not user_request:
+            return papers, []
+
+        # 构建紧凑的论文摘要列表，便于 LLM 批量判断
+        lines = []
+        for i, p in enumerate(papers):
+            title = (p.get("title") or "").strip()
+            summary = (p.get("summary") or "").strip()[:500]
+            lines.append(f"[{i}] {title}\n    {summary[:200]}")
+
+        prompt = textwrap.dedent(f"""\
+            用户需求：{user_request}
+
+            以下是 arXiv 搜索结果中的论文标题和摘要：
+
+            {chr(10).join(lines)}
+
+            请判断每篇论文是否**同时涉及**用户需求中的所有核心概念。
+            只保留严格相关的论文——宁可漏掉边界论文，也不要混入无关的。
+
+            请只输出一个 JSON 数组，包含严格相关的论文索引，例如 [0, 3]。如果都不相关输出 []。
+            """)
+
+        try:
+            model_client = create_search_model_client()
+            filter_agent = AssistantAgent(
+                name="filter_agent",
+                model_client=model_client,
+                system_message="你是一个论文相关性判断助手。你的任务是根据用户需求判断论文是否严格相关。",
+            )
+            response = await filter_agent.run(task=prompt)
+            content = response.messages[-1].content
+            if isinstance(content, str):
+                match = re.search(r"\[[\d,\s]*\]", content)
+                if match:
+                    indices = json.loads(match.group())
+                    filtered = [papers[i] for i in indices if 0 <= i < len(papers)]
+                    # 计算被丢弃的论文并记录到 debug 日志
+                    kept_set = set(indices)
+                    discard_records = []
+                    for i, p in enumerate(papers):
+                        if i not in kept_set:
+                            record = {
+                                "title": p.get("title", ""),
+                                "paper_id": p.get("paper_id", ""),
+                                "index": i,
+                            }
+                            discard_records.append(record)
+                            self.logger.debug(
+                                f"[{self.name}] 过滤丢弃 [{i}]: {p.get('title', '')} ({p.get('paper_id', '')})"
+                            )
+                    self.logger.info(
+                        f"[{self.name}] 相关性过滤：{len(papers)} → {len(filtered)} 篇"
+                    )
+                    return filtered, discard_records
+            self.logger.info(f"[{self.name}] 相关性过滤：未能解析 LLM 输出，保留全部")
+            return papers, []
+        except Exception as e:
+            self.logger.warning(f"[{self.name}] 相关性过滤异常，保留全部: {e}")
+            return papers, []
 
 
 async def search_node(state: State) -> State:
