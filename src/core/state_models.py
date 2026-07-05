@@ -97,6 +97,7 @@ class KeyInformation(BaseModel):
     main_results: str = Field(default="", description="主要结果")
     limitations: str = Field(default="", description="局限性")
     contributions: List[str] = Field(default_factory=list, description="贡献列表")
+    evidence_sections: Dict[str, str] = Field(default_factory=dict, description="各字段对应的原文章节引用")
 
 
 class ReadOutput(BaseModel):

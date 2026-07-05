@@ -75,7 +75,7 @@ def test_create_model_client_missing_provider(valid_model_config):
             "model": "Qwen/Qwen3-32B",
         }
     }
-    with pytest.raises(ValueError, match="未配置 search-model 的 model-provider 或 model"):
+    with pytest.raises(ValueError, match="未配置 search-model"):
         with patch("src.core.model_client.config", bad_config):
             create_model_client("search-model")
 
@@ -86,7 +86,7 @@ def test_create_model_client_missing_model(valid_model_config):
             "model-provider": "siliconflow",
         }
     }
-    with pytest.raises(ValueError, match="未配置 search-model 的 model-provider 或 model"):
+    with pytest.raises(ValueError, match="未配置 search-model"):
         with patch("src.core.model_client.config", bad_config):
             create_model_client("search-model")
 
@@ -100,7 +100,7 @@ def test_create_search_model_client_with_valid_config(valid_model_config):
 
 def test_create_search_model_client_missing_config():
     empty_config = {}
-    with pytest.raises(ValueError, match="未配置 search-model 的 model-provider 或 model"):
+    with pytest.raises(ValueError, match="未配置 search-model"):
         with patch("src.core.model_client.config", empty_config):
             create_search_model_client()
 

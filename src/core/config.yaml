@@ -23,3 +23,13 @@ search_node:
   # 默认排序策略（预留，当前未启用）
   # 可选值: relevance | submitted_date
   default_sort_by: relevance
+
+# 阅读节点配置
+read_node:
+  # 并发处理论文数
+  concurrency: 5
+  # 超过此 token 数触发 section 切块
+  max_tokens_threshold: 90000
+  # 模型配置（可选，默认复用 default-model）
+  model-provider: deepseek
+  model: deepseek-chat

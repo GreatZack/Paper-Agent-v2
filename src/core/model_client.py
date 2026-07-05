@@ -84,25 +84,36 @@ def create_model_client(client_type: str) -> OpenAIChatCompletionClient:
     provider = model_config.get("model-provider")
     model = model_config.get("model")
 
+    default_config = config.get("default-model", {}) or {}
+
     if not provider or not model:
-        model_config = config.get("default-model", {}) or {}
-        provider = model_config.get("model-provider")
-        model = model_config.get("model")
+        provider = default_config.get("model-provider")
+        model = default_config.get("model")
+        model_config = default_config
 
     if not provider or not model:
         raise ValueError(f"未配置 {client_type} 也未配置 default-model 的 model-provider 或 model")
 
+    # api_key / base_url: 优先取节点配置，fallback 到 default-model
+    api_key = model_config.get("api_key") or default_config.get("api_key")
+    base_url = model_config.get("base_url") or default_config.get("base_url")
+
     return ModelClient.create_client(
         provider=provider,
         model=model,
-        api_key=model_config.get("api_key"),
-        base_url=model_config.get("base_url"),
+        api_key=api_key,
+        base_url=base_url,
     )
 
 
 def create_search_model_client() -> OpenAIChatCompletionClient:
     """创建用于搜索的远程模型客户端。"""
     return create_model_client("search-model")
+
+
+def create_reading_model_client() -> OpenAIChatCompletionClient:
+    """创建用于论文阅读的远程模型客户端。"""
+    return create_model_client("read_node")
 
 
 # =============================================================================
