@@ -108,6 +108,29 @@ class ReadOutput(BaseModel):
     failed_paper_ids: List[str] = Field(default_factory=list, description="阅读失败的文档ID")
 
 
+# ==================== 验证相关数据模型 ====================
+
+
+class VerificationItem(BaseModel):
+    """单个字段的验证结果"""
+
+    field: str = Field(default="", description="验证字段名")
+    verified: bool = Field(default=False, description="是否通过验证")
+    exact_quote: str = Field(default="", description="原文中找到的对应句子")
+    reason: str = Field(default="", description="不通过的具体原因")
+    original_claim: str = Field(default="", description="待验证的原始提取内容")
+
+
+class VerifyResult(BaseModel):
+    """单篇论文的验证汇总"""
+
+    paper_id: str = Field(default="", description="关联论文ID")
+    items: List[VerificationItem] = Field(default_factory=list, description="逐字段验证结果")
+    passed: bool = Field(default=False, description="所有字段是否均通过")
+    retry_count: int = Field(default=0, description="已重试次数")
+    verified_at: Optional[str] = Field(default=None, description="验证时间戳")
+
+
 # ==================== 解析节点数据模型 ====================
 
 
@@ -242,6 +265,11 @@ class PaperAgentState(BaseModel):
     read_output: ReadOutput = Field(default_factory=ReadOutput, description="阅读节点输出")
     parse_output: ParseOutput = Field(default_factory=ParseOutput, description="解析节点输出")
     write_output: WriteOutput = Field(default_factory=WriteOutput, description="撰写节点输出")
+
+    # 验证结果（证据链条）
+    verify_results: Dict[str, VerifyResult] = Field(
+        default_factory=dict, description="验证结果，key 为 paper_id"
+    )
 
     # 配置与上下文
     config: Dict[str, Any] = Field(default_factory=dict, description="运行时配置")

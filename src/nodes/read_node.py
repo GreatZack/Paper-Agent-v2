@@ -8,7 +8,7 @@ from autogen_core.models import SystemMessage, UserMessage
 from pydantic import ValidationError
 
 from src.core.model_client import create_reading_model_client
-from src.core.prompts import read_agent_prompt
+from src.core.prompts import read_agent_prompt, verify_prompt
 from src.core.state_models import (
     BackToFrontData,
     ExecutionState,
@@ -17,6 +17,8 @@ from src.core.state_models import (
     ReadOutput,
     ReadingStrategy,
     State,
+    VerificationItem,
+    VerifyResult,
 )
 from src.nodes.base_node import BaseNode
 
@@ -34,6 +36,7 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         self.concurrency: int = int(cfg.get("concurrency", 5))
         self.max_tokens_threshold: int = int(cfg.get("max_tokens_threshold", 90000))
         self._model_client = None
+        self._markdown_cache: Dict[str, str] = {}
 
     # ── 核心入口 ──────────────────────────────────────────────
 
@@ -97,6 +100,7 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         try:
             # 1. PDF → Markdown
             md_text = await asyncio.to_thread(self._extract_markdown, pdf_path)
+            self._markdown_cache[paper_id] = md_text  # 缓存供验证使用
 
             # 2. Token 估算 → 决定是否切块
             if self._estimate_tokens(md_text) > self.max_tokens_threshold:
@@ -364,6 +368,66 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                 parts.append(val)
         return "\n".join(parts)
 
+    # ── 验证 ──────────────────────────────────────────────────
+
+    async def _verify_one_paper(
+        self, md_text: str, ki: KeyInformation
+    ) -> Optional[VerifyResult]:
+        """用 LLM 验证一篇论文的提取结果是否忠实于原文。"""
+        paper_id = ki.paper_id
+
+        # 构造验证输入：只取需要验证的三个字段
+        claims_to_verify = {
+            "key_methodology": ki.key_methodology,
+            "main_results": ki.main_results,
+            "limitations": ki.limitations,
+        }
+
+        import json as json_lib
+        user_content = (
+            f"## 论文全文（Markdown）\n\n{md_text}\n\n"
+            f"## 提取结果（待验证）\n\n{json_lib.dumps(claims_to_verify, ensure_ascii=False, indent=2)}"
+        )
+
+        messages = [
+            SystemMessage(content=verify_prompt),
+            UserMessage(content=user_content, source="user"),
+        ]
+
+        client = self._get_model_client()
+        try:
+            result = await client.create(messages=messages, json_output=True)
+            content = self._strip_json_fence(result.content)
+            parsed = json_lib.loads(content)
+
+            items = []
+            for field in ("key_methodology", "main_results", "limitations"):
+                field_result = parsed.get(field, {})
+                items.append(VerificationItem(
+                    field=field,
+                    verified=bool(field_result.get("verified", False)),
+                    exact_quote=str(field_result.get("exact_quote", "")),
+                    reason=str(field_result.get("reason", "")),
+                    original_claim=str(claims_to_verify.get(field, "")),
+                ))
+
+            from datetime import datetime
+            verify_result = VerifyResult(
+                paper_id=paper_id,
+                items=items,
+                passed=all(item.verified for item in items),
+                retry_count=0,  # 由适配函数管理
+                verified_at=datetime.now().isoformat(),
+            )
+            self.logger.info(
+                f"[read_node] {paper_id}: 验证{'通过' if verify_result.passed else '不通过 — retry_count保留给适配函数管理'}"
+            )
+            return verify_result
+
+        except Exception as e:
+            self.logger.error(f"[read_node] {paper_id}: 验证调用异常 — {e}")
+            return None
+
     # ── 模型客户端 ────────────────────────────────────────────
 
     def _get_model_client(self):
@@ -377,7 +441,7 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
 
 
 async def read_node(state: State) -> State:
-    """LangGraph 适配函数：阅读节点。"""
+    """LangGraph 适配函数：阅读节点，含提取 + 验证。"""
     state_queue = state["state_queue"]
     current_state = state["value"]
 
@@ -388,28 +452,67 @@ async def read_node(state: State) -> State:
         )
 
         read_config = current_state.config.get("read_node", {})
+        verify_cfg = read_config.get("verify", {})
+        verify_enabled = verify_cfg.get("enabled", True)
+
         node = ReadNode(read_config)
 
-        focus_areas = read_config.get(
-            "focus_areas", ["method", "result", "limitation"]
-        )
-        read_input = ReadInput(
-            documents=current_state.search_output.results,
-            reading_strategy=ReadingStrategy(
-                focus_areas=focus_areas,
-                depth=read_config.get("depth", "deep"),
-            ),
-        )
+        # ── 筛选尚未通过验证的论文 ──
+        existing_results = current_state.verify_results or {}
+        papers_to_process = [
+            doc for doc in current_state.search_output.results
+            if not (doc.paper_id in existing_results and existing_results[doc.paper_id].passed)
+        ]
 
-        read_output = await node.run(read_input)
-        current_state.read_output = read_output
+        if papers_to_process:
+            focus_areas = read_config.get("focus_areas", ["method", "result", "limitation"])
+            read_input = ReadInput(
+                documents=papers_to_process,
+                reading_strategy=ReadingStrategy(
+                    focus_areas=focus_areas,
+                    depth=read_config.get("depth", "deep"),
+                ),
+            )
+
+            read_output = await node.run(read_input)
+
+            # ── 验证 ──
+            if verify_enabled:
+                for ki in read_output.key_info:
+                    md_text = node._markdown_cache.get(ki.paper_id, "")
+                    if md_text:
+                        verify_result = await node._verify_one_paper(md_text, ki)
+                        if verify_result:
+                            prev = existing_results.get(ki.paper_id)
+                            if prev:
+                                verify_result.retry_count = prev.retry_count + 1
+                            current_state.verify_results[ki.paper_id] = verify_result
+
+            # ── 合并新旧结果 ──
+            old_key_info = current_state.read_output.key_info or []
+            updated_results = current_state.verify_results
+            passed_ids = {pid for pid, vr in updated_results.items() if vr.passed}
+            merged = [ki for ki in old_key_info if ki.paper_id in passed_ids]
+            merged.extend(read_output.key_info)
+
+            current_state.read_output = ReadOutput(
+                key_info=merged,
+                status="completed",
+                failed_paper_ids=read_output.failed_paper_ids,
+            )
+
+        # ── 统计状态 ──
+        total_papers = len(current_state.search_output.results)
+        verified_count = sum(1 for vr in current_state.verify_results.values() if vr.passed)
+        failed_verify = sum(1 for vr in current_state.verify_results.values() if not vr.passed)
+        extract_failed = len(current_state.read_output.failed_paper_ids)
 
         await state_queue.put(
             BackToFrontData(
                 step=ExecutionState.READING,
                 state="completed",
-                data=f"阅读完成，共提取 {len(read_output.key_info)} 条关键信息"
-                f"（{len(read_output.failed_paper_ids)} 篇失败）",
+                data=f"阅读完成 — 已验证 {verified_count}/{total_papers} 篇"
+                f"（待重试 {failed_verify} 篇，提取失败 {extract_failed} 篇）",
             )
         )
         return {"value": current_state}

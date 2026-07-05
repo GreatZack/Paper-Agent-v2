@@ -33,3 +33,11 @@ read_node:
   # 模型配置（可选，默认复用 default-model）
   model-provider: deepseek
   model: deepseek-chat
+  # 证据验证配置
+  verify:
+    enabled: true                     # 是否启用验证
+    max_retries_per_paper: 3          # 单篇最大验证重试次数
+    fields_to_verify:                 # 需验证的字段列表
+      - key_methodology
+      - main_results
+      - limitations

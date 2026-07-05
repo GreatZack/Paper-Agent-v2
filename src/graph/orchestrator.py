@@ -81,8 +81,45 @@ class WorkflowOrchestrator:
 
         if step == ExecutionState.SEARCHING and err.search_node_error is None:
             return "read_node"
-        elif step == ExecutionState.READING and err.read_node_error is None:
+
+        elif step == ExecutionState.READING:
+            if err.read_node_error:
+                return "error_node"
+
+            # 检查是否启用验证
+            verify_cfg = current_state.config.get("read_node", {}).get("verify", {})
+            verify_enabled = verify_cfg.get("enabled", True)
+            if not verify_enabled:
+                return "parse_node"
+
+            verify_results = current_state.verify_results or {}
+            if not verify_results:
+                # 首次进入或所有结果被清空
+                return "read_node"
+
+            max_retries = int(verify_cfg.get("max_retries_per_paper", 3))
+            any_failed = False
+
+            for paper_id, result in verify_results.items():
+                if not result.passed:
+                    any_failed = True
+                    if result.retry_count >= max_retries:
+                        self.logger.error(
+                            f"[_route] 论文 {paper_id} 验证超限 "
+                            f"(retry_count={result.retry_count}/{max_retries})，路由到 error_node"
+                        )
+                        return "error_node"
+
+            if any_failed:
+                # 有论文未通过但未超限，回 read_node 重试
+                self.logger.info(
+                    "[_route] 部分论文验证未通过，回 read_node 重试"
+                )
+                return "read_node"
+
+            # 全部通过
             return "parse_node"
+
         elif step == ExecutionState.PARSING and err.parse_node_error is None:
             return "write_node"
         elif step == ExecutionState.WRITING and err.write_node_error is None:
