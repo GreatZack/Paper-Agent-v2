@@ -1,9 +1,13 @@
 import asyncio
+import io
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import fitz
 import pymupdf4llm
+from PIL import Image as PILImage
+from autogen_core import Image as AutoGenImage
 from autogen_core.models import SystemMessage, UserMessage
 from pydantic import ValidationError
 
@@ -23,6 +27,17 @@ from src.core.state_models import (
 from src.nodes.base_node import BaseNode
 
 
+class _DetailImage(AutoGenImage):
+    """覆写 to_openai_format 使 detail 参数生效。"""
+
+    def __init__(self, pil_image: PILImage.Image, detail: str = "low"):
+        super().__init__(pil_image)
+        self._detail = detail
+
+    def to_openai_format(self, detail: str = "auto"):
+        return super().to_openai_format(self._detail)
+
+
 class ReadNode(BaseNode[ReadInput, ReadOutput]):
     """阅读节点：从 PDF 提取文本，用 LLM 逐篇抽取 KeyInformation。"""
 
@@ -35,8 +50,16 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         cfg = self.config or {}
         self.concurrency: int = int(cfg.get("concurrency", 5))
         self.max_tokens_threshold: int = int(cfg.get("max_tokens_threshold", 90000))
+
+        image_cfg = cfg.get("image", {}) or {}
+        self.use_images: bool = bool(cfg.get("use_images", True))
+        self.image_dpi: int = int(image_cfg.get("dpi", 150))
+        self.image_detail: str = image_cfg.get("detail", "low")
+        self.image_max_size: int = int(image_cfg.get("max_size", 1024))
+
         self._model_client = None
         self._markdown_cache: Dict[str, str] = {}
+        self._image_cache: Dict[str, List[_DetailImage]] = {}
 
     # ── 核心入口 ──────────────────────────────────────────────
 
@@ -98,24 +121,42 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             return None
 
         try:
-            # 1. PDF → Markdown
-            md_text = await asyncio.to_thread(self._extract_markdown, pdf_path)
-            self._markdown_cache[paper_id] = md_text  # 缓存供验证使用
+            full_text, page_texts, page_images = await asyncio.to_thread(
+                self._extract_pdf_content, pdf_path
+            )
+            self._markdown_cache[paper_id] = full_text
+            if self.use_images:
+                self._image_cache[paper_id] = page_images
 
-            # 2. Token 估算 → 决定是否切块
-            if self._estimate_tokens(md_text) > self.max_tokens_threshold:
-                self.logger.info(f"[read_node] {paper_id}: 论文过长，按 section 切块")
-                chunks = self._split_by_section(md_text)
+            if self.use_images and page_texts:
+                page_groups = self._group_pages_into_chunks(page_texts, page_images)
                 chunk_results = []
-                for chunk in chunks:
-                    result = await self._call_llm_extract(chunk, strategy, paper)
+                for group_texts, group_images in page_groups:
+                    group_full = "\n\n".join(group_texts)
+                    result = await self._call_llm_extract(
+                        group_full, strategy, paper,
+                        page_texts=group_texts,
+                        page_images=group_images,
+                    )
                     if result:
                         chunk_results.append(result)
                 if not chunk_results:
                     return None
                 return self._merge_chunk_results(chunk_results)
             else:
-                return await self._call_llm_extract(md_text, strategy, paper)
+                if self._estimate_tokens(full_text) > self.max_tokens_threshold:
+                    self.logger.info(f"[read_node] {paper_id}: 论文过长，按 section 切块")
+                    chunks = self._split_by_section(full_text)
+                    chunk_results = []
+                    for chunk in chunks:
+                        result = await self._call_llm_extract(chunk, strategy, paper)
+                        if result:
+                            chunk_results.append(result)
+                    if not chunk_results:
+                        return None
+                    return self._merge_chunk_results(chunk_results)
+                else:
+                    return await self._call_llm_extract(full_text, strategy, paper)
 
         except Exception as e:
             self.logger.error(f"[read_node] {paper_id}: 处理异常 — {e}")
@@ -123,9 +164,53 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
 
     # ── PDF 提取 ──────────────────────────────────────────────
 
-    def _extract_markdown(self, pdf_path: str) -> str:
-        """pymupdf4llm 提取 Markdown，失败即抛异常。"""
-        return pymupdf4llm.to_markdown(pdf_path)
+    def _resize_pil_image(self, pil_img: PILImage.Image) -> PILImage.Image:
+        """缩放图片到 self.image_max_size 以内，控制内存。"""
+        w, h = pil_img.size
+        max_dim = max(w, h)
+        if max_dim <= self.image_max_size:
+            return pil_img
+        ratio = self.image_max_size / max_dim
+        return pil_img.resize((int(w * ratio), int(h * ratio)), PILImage.LANCZOS)
+
+    def _render_pdf_pages(self, pdf_path: str) -> List[_DetailImage]:
+        """将 PDF 每页渲染为图片，返回 _DetailImage 列表。"""
+        doc = fitz.open(pdf_path)
+        images: List[_DetailImage] = []
+        for page in doc:
+            pix = page.get_pixmap(dpi=self.image_dpi)
+            pil_img = PILImage.open(io.BytesIO(pix.tobytes("png")))
+            pil_img = self._resize_pil_image(pil_img)
+            images.append(_DetailImage(pil_img, detail=self.image_detail))
+        doc.close()
+        return images
+
+    def _extract_pdf_content(
+        self, pdf_path: str
+    ) -> Tuple[str, List[str], List[_DetailImage]]:
+        """
+        提取 PDF 并返回:
+            full_text:   全文 markdown
+            page_texts:  每页 markdown 文本列表
+            page_images: 每页渲染图片列表
+        """
+        page_chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+        page_texts = [chunk["text"] for chunk in page_chunks]
+        full_text = "\n\n".join(page_texts)
+
+        if self.use_images:
+            page_images = self._render_pdf_pages(pdf_path)
+            if len(page_texts) != len(page_images):
+                self.logger.warning(
+                    f"page_texts({len(page_texts)}) != page_images({len(page_images)}), truncating"
+                )
+                min_count = min(len(page_texts), len(page_images))
+                page_texts = page_texts[:min_count]
+                page_images = page_images[:min_count]
+        else:
+            page_images = []
+
+        return full_text, page_texts, page_images
 
     # ── Token 估算 ────────────────────────────────────────────
 
@@ -183,29 +268,35 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
     # ── LLM 提取 ──────────────────────────────────────────────
 
     async def _call_llm_extract(
-        self, text: str, strategy: ReadingStrategy, paper
+        self,
+        text: str,
+        strategy: ReadingStrategy,
+        paper,
+        page_texts: Optional[List[str]] = None,
+        page_images: Optional[List[_DetailImage]] = None,
     ) -> Optional[KeyInformation]:
-        """调用 LLM 从论文文本中抽取 KeyInformation，最多重试 1 次。"""
+        """调用 LLM 抽取 KeyInformation，最多重试 1 次。"""
         paper_id = getattr(paper, "paper_id", "")
-        title = getattr(paper, "title", "")
-        authors = getattr(paper, "authors", [])
-        summary = getattr(paper, "summary", "")
-
         client = self._get_model_client()
-        user_prompt = self._build_user_prompt(text, strategy, paper)
+
+        if self.use_images and page_texts and page_images:
+            content = self._build_multimodal_content(strategy, paper, page_texts, page_images)
+        else:
+            content = self._build_user_prompt(text, strategy, paper)
+
         messages = [
             SystemMessage(content=read_agent_prompt),
-            UserMessage(content=user_prompt, source="user"),
+            UserMessage(content=content, source="user"),
         ]
 
         for attempt in range(2):
             try:
                 result = await client.create(messages=messages, json_output=True)
-                content = result.content
+                content_str = result.content
 
                 # 清理可能的 markdown 代码块包装
-                content = self._strip_json_fence(content)
-                parsed = json.loads(content)
+                content_str = self._strip_json_fence(content_str)
+                parsed = json.loads(content_str)
                 parsed = self._normalize_types(parsed)
                 parsed["paper_id"] = paper_id
                 key_info = KeyInformation(**parsed)
@@ -225,6 +316,80 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                 return None
 
         return None
+
+    def _build_header_prompt(self, strategy: ReadingStrategy, paper) -> str:
+        """构造多模态路径的头部 prompt（不含论文全文）。"""
+        title = getattr(paper, "title", "")
+        authors = getattr(paper, "authors", [])
+        summary = getattr(paper, "summary", "")
+        authors_str = ", ".join(authors) if authors else "未知"
+        focus_areas = ", ".join(strategy.focus_areas) if strategy.focus_areas else "method, result, limitation"
+
+        depth = getattr(strategy, "depth", "medium")
+        depth_instruction = {
+            "shallow": "做简要提取，每个字段 2-3 句话即可。",
+            "medium": "做中等详细度的提取，保留关键技术细节和主要实验数据，每个字段 5-10 句话。",
+            "deep": (
+                "做深度提取，把这篇论文当作唯一的信息来源。每个字段必须详尽：\n"
+                "- core_problem: 说清楚问题的背景、现有方法的不足、本文的目标\n"
+                "- key_methodology: 完整描述技术架构（所有模块）、训练策略、使用的数据集、超参数、评估协议\n"
+                "- main_results: 逐实验、逐数据集、逐指标列出所有数值，不要省略任何一行结果表格的数据\n"
+                "- limitations: 逐一列出每个局限，说明为什么存在、影响是什么\n"
+                "- contributions: 列出所有贡献点"
+            ),
+        }.get(depth, "做中等详细度的提取，保留关键技术细节和主要实验数据，每个字段 5-10 句话。")
+
+        return (
+            f"## 论文元信息\n"
+            f"- 标题：{title}\n"
+            f"- 作者：{authors_str}\n"
+            f"- 摘要：{summary}\n\n"
+            f"## 提取要求\n"
+            f"- 详细程度：{depth_instruction}\n"
+            f"- 重点关注维度：{focus_areas}\n\n"
+            f"## 论文全文（逐页展示，每页文本后附该页原文截图）"
+        )
+
+    def _build_multimodal_content(
+        self,
+        strategy: ReadingStrategy,
+        paper,
+        page_texts: List[str],
+        page_images: List[_DetailImage],
+    ) -> List[Union[str, _DetailImage]]:
+        """构建多模态消息内容：header + 逐页图文交错。"""
+        header = self._build_header_prompt(strategy, paper)
+        content: List[Union[str, _DetailImage]] = [header]
+        for i, (text, img) in enumerate(zip(page_texts, page_images)):
+            content.append(f"\n--- 第 {i + 1} 页 ---\n{text}")
+            content.append(img)
+        return content
+
+    def _group_pages_into_chunks(
+        self,
+        page_texts: List[str],
+        page_images: List[_DetailImage],
+    ) -> List[Tuple[List[str], List[_DetailImage]]]:
+        """按 token 预算将页面分组，每组附带对应图片。"""
+        IMAGE_TOKEN_BUDGET = 85
+        chunks: List[Tuple[List[str], List[_DetailImage]]] = []
+        cur_texts: List[str] = []
+        cur_imgs: List[_DetailImage] = []
+        cur_tokens = 0
+
+        for text, img in zip(page_texts, page_images):
+            entry_tokens = self._estimate_tokens(text) + IMAGE_TOKEN_BUDGET
+            if cur_tokens + entry_tokens > self.max_tokens_threshold and cur_texts:
+                chunks.append((cur_texts, cur_imgs))
+                cur_texts, cur_imgs, cur_tokens = [text], [img], entry_tokens
+            else:
+                cur_texts.append(text)
+                cur_imgs.append(img)
+                cur_tokens += entry_tokens
+
+        if cur_texts:
+            chunks.append((cur_texts, cur_imgs))
+        return chunks
 
     def _build_user_prompt(
         self, text: str, strategy: ReadingStrategy, paper
@@ -376,18 +541,24 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         """用 LLM 验证一篇论文的提取结果是否忠实于原文。"""
         paper_id = ki.paper_id
 
-        # 构造验证输入：只取需要验证的三个字段
         claims_to_verify = {
             "key_methodology": ki.key_methodology,
             "main_results": ki.main_results,
             "limitations": ki.limitations,
         }
 
-        import json as json_lib
-        user_content = (
+        text_part = (
             f"## 论文全文（Markdown）\n\n{md_text}\n\n"
-            f"## 提取结果（待验证）\n\n{json_lib.dumps(claims_to_verify, ensure_ascii=False, indent=2)}"
+            f"## 提取结果（待验证）\n\n"
+            f"{json.dumps(claims_to_verify, ensure_ascii=False, indent=2)}"
         )
+
+        page_images = self._image_cache.get(paper_id, [])
+        if self.use_images and page_images:
+            text_part += "\n\n## 附：论文原文页面截图（可辅助核对图表和数值）"
+            user_content: Union[str, List] = [text_part] + page_images
+        else:
+            user_content = text_part
 
         messages = [
             SystemMessage(content=verify_prompt),
@@ -398,7 +569,7 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         try:
             result = await client.create(messages=messages, json_output=True)
             content = self._strip_json_fence(result.content)
-            parsed = json_lib.loads(content)
+            parsed = json.loads(content)
 
             items = []
             for field in ("key_methodology", "main_results", "limitations"):
@@ -416,11 +587,11 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                 paper_id=paper_id,
                 items=items,
                 passed=all(item.verified for item in items),
-                retry_count=0,  # 由适配函数管理
+                retry_count=0,
                 verified_at=datetime.now().isoformat(),
             )
             self.logger.info(
-                f"[read_node] {paper_id}: 验证{'通过' if verify_result.passed else '不通过 — retry_count保留给适配函数管理'}"
+                f"[read_node] {paper_id}: 验证{'通过' if verify_result.passed else '不通过'}"
             )
             return verify_result
 
@@ -487,6 +658,7 @@ async def read_node(state: State) -> State:
                             if prev:
                                 verify_result.retry_count = prev.retry_count + 1
                             current_state.verify_results[ki.paper_id] = verify_result
+                    node._image_cache.pop(ki.paper_id, None)
 
             # ── 合并新旧结果 ──
             old_key_info = current_state.read_output.key_info or []

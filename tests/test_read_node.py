@@ -163,7 +163,7 @@ class TestFailedPapers:
         assert len(result.key_info) == 0
 
 
-# ── 端到端单篇测试（真调 DeepSeek API）─────────────────────────
+# ── 端到端单篇测试（真调 Mimo API）─────────────────────────
 
 @pytest.mark.slow
 class TestEndToEnd:

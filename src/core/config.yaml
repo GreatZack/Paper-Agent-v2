@@ -2,11 +2,11 @@
 # 所有节点统一使用 default-model，不再区分 search-model / reading-model
 
 default-model:
-  model-provider: deepseek
-  model: deepseek-chat
+  model-provider: mimo
+  model: mimo-v2.5
   # api_key 可以直接填写，也可以引用 .env 中的环境变量名
-  api_key: ${DEEPSEEK_API_KEY}
-  base_url: https://api.deepseek.com/v1
+  api_key: ${MIMO_API_KEY}
+  base_url: https://opencode.ai/zen/go/v1
 
 # 搜索节点配置（预留字段，当前未全部启用）
 search_node:
@@ -31,8 +31,14 @@ read_node:
   # 超过此 token 数触发 section 切块
   max_tokens_threshold: 90000
   # 模型配置（可选，默认复用 default-model）
-  model-provider: deepseek
-  model: deepseek-chat
+  model-provider: mimo
+  model: mimo-v2.5
+  # 多模态图文提取
+  use_images: true
+  image:
+    detail: low
+    dpi: 150
+    max_size: 1024
   # 证据验证配置
   verify:
     enabled: true                     # 是否启用验证
