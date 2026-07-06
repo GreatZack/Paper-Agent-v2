@@ -3,26 +3,31 @@ import asyncio
 from src.core.state_models import BackToFrontData
 from src.graph.orchestrator import WorkflowOrchestrator
 
+# 导出为模块级常量，供测试脚本导入
+USER_REQUEST = "帮我调研agent memory近期的发展现状"
+MAX_PAPERS = 10
+ORCHESTRATOR_CONFIG = {
+    "search_node": {
+        "use_llm": True,
+        "download_pdf": True,
+        "pdf_download_dir": "data/papers",
+    }
+}
+
 
 async def main():
     """工作流示例入口。"""
     state_queue = asyncio.Queue()
     orchestrator = WorkflowOrchestrator(
         state_queue=state_queue,
-        config={
-            "search_node": {
-                "use_llm": True,
-                "download_pdf": True,
-                "pdf_download_dir": "data/papers",
-            }
-        },
+        config=ORCHESTRATOR_CONFIG,
     )
 
     # 启动工作流（不阻塞，便于同时消费状态队列）
     workflow_task = asyncio.create_task(
         orchestrator.start(
-            user_request="帮我调研大型语言模型在自动驾驶领域的应用现状",
-            max_papers=3,
+            user_request=USER_REQUEST,
+            max_papers=MAX_PAPERS,
         )
     )
 

@@ -347,7 +347,12 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             f"## 提取要求\n"
             f"- 详细程度：{depth_instruction}\n"
             f"- 重点关注维度：{focus_areas}\n\n"
-            f"## 论文全文（逐页展示，每页文本后附该页原文截图）"
+            f"## 论文全文（逐页展示，每页文本后附该页原文截图）\n"
+            f"请逐页阅读文本和截图。重点关注截图中的图表、表格和流程图，"
+            f"提取其中的关键数值、趋势和结构信息，"
+            f"尤其关注文本中未完整呈现的实验结果和架构设计。\n"
+            f"注意：截图受渲染精度影响可能不清晰，请以文本中的数值为准，"
+            f"截图仅作为补充参考。"
         )
 
     def _build_multimodal_content(
