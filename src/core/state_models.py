@@ -254,7 +254,7 @@ class PaperAgentState(BaseModel):
 
     # 用户输入
     user_request: str = Field(description="用户的原始输入请求")
-    max_papers: int = Field(default=50, description="最大论文数量")
+    max_papers: int = Field(description="最大论文数量")
 
     # 执行状态
     current_step: ExecutionState = Field(default=ExecutionState.INITIALIZING, description="当前执行步骤")

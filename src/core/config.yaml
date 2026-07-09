@@ -47,3 +47,6 @@ read_node:
       - key_methodology
       - main_results
       - limitations
+
+# 全局默认配置
+default_max_papers: 20

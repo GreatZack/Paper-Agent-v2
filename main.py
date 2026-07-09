@@ -1,11 +1,12 @@
 import asyncio
 
+from src.core.config import config
 from src.core.state_models import BackToFrontData
 from src.graph.orchestrator import WorkflowOrchestrator
 
 # 导出为模块级常量，供测试脚本导入
 USER_REQUEST = "帮我调研超声影像医学图像分割算法的近3年的进展"
-MAX_PAPERS = 20
+MAX_PAPERS = int(config.get("default_max_papers", 50))
 ORCHESTRATOR_CONFIG = {
     "search_node": {
         "use_llm": True,

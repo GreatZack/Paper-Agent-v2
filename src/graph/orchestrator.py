@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 from langgraph.graph import END, START, StateGraph
 
+from src.core.config import config
 from src.core.state_models import (
     BackToFrontData,
     ConfigSchema,
@@ -95,6 +96,17 @@ class WorkflowOrchestrator:
             verify_results = current_state.verify_results or {}
             if not verify_results:
                 # 首次进入或所有结果被清空
+                # 如果 read_node 已执行过且全部论文读取失败，则终止流程
+                read_output = current_state.read_output
+                if read_output.failed_paper_ids and len(read_output.key_info) == 0:
+                    total = len(current_state.search_output.results)
+                    failed = len(read_output.failed_paper_ids)
+                    if total > 0 and failed >= total:
+                        err.read_node_error = (
+                            f"所有论文读取失败 ({failed}/{total})，"
+                            f"可能是 PDF 未下载或路径无效"
+                        )
+                        return "error_node"
                 return "read_node"
 
             max_retries = int(verify_cfg.get("max_retries_per_paper", 3))
@@ -144,9 +156,11 @@ class WorkflowOrchestrator:
     async def initialize(
         self,
         user_request: str,
-        max_papers: int = 50,
+        max_papers: int = None,
         **kwargs: Any,
     ) -> PaperAgentState:
+        if max_papers is None:
+            max_papers = int(config.get("default_max_papers", 50))
         """初始化工作流状态。"""
         initial_state = PaperAgentState(
             user_request=user_request,
@@ -160,7 +174,7 @@ class WorkflowOrchestrator:
     async def start(
         self,
         user_request: str,
-        max_papers: int = 50,
+        max_papers: int = None,
         **kwargs: Any,
     ) -> PaperAgentState:
         """启动并执行完整工作流。"""

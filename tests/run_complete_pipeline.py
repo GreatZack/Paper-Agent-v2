@@ -11,12 +11,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.core.config import config
 from src.graph.orchestrator import WorkflowOrchestrator
 from src.core.state_models import BackToFrontData, ExecutionState
 from src.nodes.write_node import WriteNode
 
 USER_REQUEST = "帮我调研超声影像医学图像分割算法的近3年的进展"
-MAX_PAPERS = 20
+MAX_PAPERS = int(config.get("default_max_papers", 50))
 OUTPUT_DIR = Path("output/complete_pipeline")
 ORCHESTRATOR_CONFIG = {
     "search_node": {

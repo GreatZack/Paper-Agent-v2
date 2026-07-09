@@ -16,6 +16,8 @@ autogen-ext = {extras = ["openai"], version = "^0.7.4"}
 python-dotenv = ">=1.1.1,<2.0.0"
 pyyaml = ">=6.0.2,<7.0.0"
 pymupdf4llm = ">=0.1.0"
+fastapi = ">=0.115.0"
+uvicorn = {extras = ["standard"], version = ">=0.30.0"}
 
 [[tool.poetry.source]]
 name = "tsinghua"
