@@ -16,7 +16,11 @@ app = FastAPI(title="Paper-Agent-v2 API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://greatzack.github.io",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
