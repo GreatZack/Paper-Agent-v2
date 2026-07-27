@@ -5,7 +5,6 @@ import arxiv
 import pytest
 
 from src.core.state_models import (
-    BackToFrontData,
     ExecutionState,
     NodeError,
     PaperAgentState,
@@ -65,8 +64,8 @@ async def test_search_node_process_without_llm(sample_papers):
     assert output.results[0].pdf_url == "http://arxiv.org/pdf/2411.11607v2"
     node.paper_searcher.search_papers.assert_awaited_once_with(
         query='(all:"ROS2" AND all:"automated driving")',
-        max_results=5,
-        sort_by=arxiv.SortCriterion.SubmittedDate,
+        max_results=25,
+        sort_by=arxiv.SortCriterion.Relevance,
         sort_order=arxiv.SortOrder.Descending,
     )
 
@@ -83,7 +82,7 @@ async def test_search_node_process_with_llm_generated_query(sample_papers):
     node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
     node._filter_relevant_papers = AsyncMock(side_effect=lambda papers, *a, **kw: (papers, []))
 
-    with patch("src.nodes.search_node.get_search_agent", return_value=mock_agent):
+    with patch.object(node, "_get_search_agent", return_value=mock_agent):
         input_data = SearchInput(
             query_keywords=["default"],
             search_scope=SearchScope(max_results=5),
@@ -97,8 +96,8 @@ async def test_search_node_process_with_llm_generated_query(sample_papers):
     assert 'all:"autonomous driving"' in output.metadata["arxiv_query"]
     node.paper_searcher.search_papers.assert_awaited_once_with(
         query='(all:"LLM" AND all:"autonomous driving") AND submittedDate:[20230101 TO 20231231]',
-        max_results=5,
-        sort_by=arxiv.SortCriterion.SubmittedDate,
+        max_results=25,
+        sort_by=arxiv.SortCriterion.Relevance,
         sort_order=arxiv.SortOrder.Descending,
     )
 
@@ -119,7 +118,7 @@ async def test_search_node_with_scope_date_uses_relevance_sort(sample_papers):
 
     node.paper_searcher.search_papers.assert_awaited_once_with(
         query='(all:"LLM")',
-        max_results=5,
+        max_results=25,
         sort_by=arxiv.SortCriterion.Relevance,
         sort_order=arxiv.SortOrder.Descending,
     )
@@ -131,7 +130,7 @@ async def test_search_node_process_llm_agent_unavailable_raises(sample_papers):
     node = SearchNode(config={"use_llm": True, "query_retry_limit": 2})
     node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
 
-    with patch("src.nodes.search_node.get_search_agent", return_value=None):
+    with patch.object(node, "_get_search_agent", return_value=None):
         input_data = SearchInput(
             query_keywords=["fallback keyword"],
             search_scope=SearchScope(max_results=5),
@@ -152,7 +151,7 @@ async def test_search_node_process_llm_invalid_query_all_retries_exhausted(sampl
     node = SearchNode(config={"use_llm": True, "query_retry_limit": 2})
     node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
 
-    with patch("src.nodes.search_node.get_search_agent", return_value=mock_agent):
+    with patch.object(node, "_get_search_agent", return_value=mock_agent):
         input_data = SearchInput(
             query_keywords=["fallback"],
             search_scope=SearchScope(max_results=5),
@@ -179,7 +178,7 @@ async def test_search_node_process_llm_retry_success(sample_papers):
     node.paper_searcher.search_papers = AsyncMock(return_value=sample_papers)
     node._filter_relevant_papers = AsyncMock(side_effect=lambda papers, *a, **kw: (papers, []))
 
-    with patch("src.nodes.search_node.get_search_agent", return_value=mock_agent):
+    with patch.object(node, "_get_search_agent", return_value=mock_agent):
         input_data = SearchInput(
             query_keywords=["default"],
             search_scope=SearchScope(max_results=5),
@@ -328,8 +327,8 @@ async def test_filter_relevant_papers_returns_discarded():
     mock_agent.run = AsyncMock(return_value=mock_response)
 
     with patch("src.nodes.search_node.AssistantAgent", return_value=mock_agent):
-        with patch("src.nodes.search_node.create_search_model_client") as mock_client:
-            mock_client.return_value = MagicMock()
+        with patch("src.nodes.search_node.create_model_client") as mock_client:
+            mock_client.return_value = MagicMock(close=AsyncMock())
             kept, discarded = await node._filter_relevant_papers(
                 papers, "test request", ["test"]
             )
@@ -359,8 +358,8 @@ async def test_filter_relevant_papers_discarded_empty_when_parse_fails():
     mock_agent.run = AsyncMock(return_value=mock_response)
 
     with patch("src.nodes.search_node.AssistantAgent", return_value=mock_agent):
-        with patch("src.nodes.search_node.create_search_model_client") as mock_client:
-            mock_client.return_value = MagicMock()
+        with patch("src.nodes.search_node.create_model_client") as mock_client:
+            mock_client.return_value = MagicMock(close=AsyncMock())
             kept, discarded = await node._filter_relevant_papers(
                 papers, "test request", ["test"]
             )
@@ -386,6 +385,72 @@ def test_to_search_result():
     assert result.paper_id == "1234.56789"
     assert result.published == "2024-01-01T00:00:00"
     assert result.metadata["published_year"] == 2024
+
+
+@pytest.mark.parametrize(
+    ("target_count", "expected_candidates"),
+    [(1, 20), (3, 20), (5, 25), (8, 40), (10, 50)],
+)
+def test_candidate_pool_size(target_count, expected_candidates):
+    node = SearchNode(config={"use_llm": False})
+
+    assert node._candidate_count(target_count) == expected_candidates
+
+
+@pytest.mark.asyncio
+async def test_search_filters_candidates_before_applying_target_limit(sample_papers):
+    candidates = [
+        {**sample_papers[0], "paper_id": f"paper-{index}"} for index in range(20)
+    ]
+    node = SearchNode(config={"use_llm": False})
+    node.paper_searcher.search_papers = AsyncMock(return_value=candidates)
+    node._filter_relevant_papers = AsyncMock(
+        side_effect=lambda papers, *args: (papers, [])
+    )
+
+    output = await node.process(
+        SearchInput(
+            query_keywords=["transformer"],
+            search_scope=SearchScope(max_results=1),
+            user_request="transformer architecture",
+        )
+    )
+
+    assert output.total_count == 1
+    assert output.metadata["candidate_count"] == 20
+    assert output.metadata["filtered_kept"] == 20
+    assert output.metadata["returned_count"] == 1
+    node.paper_searcher.search_papers.assert_awaited_once_with(
+        query='(all:"transformer")',
+        max_results=20,
+        sort_by=arxiv.SortCriterion.Relevance,
+        sort_order=arxiv.SortOrder.Descending,
+    )
+
+
+def test_explicit_latest_request_uses_submitted_date_sort():
+    node = SearchNode(config={"use_llm": False})
+
+    assert (
+        node._sort_criterion("查找最新的 Transformer 论文")
+        == arxiv.SortCriterion.SubmittedDate
+    )
+
+
+def test_search_agents_are_isolated_per_node():
+    clients = [MagicMock(), MagicMock()]
+    agents = [MagicMock(), MagicMock()]
+
+    with (
+        patch("src.nodes.search_node.create_model_client", side_effect=clients),
+        patch("src.nodes.search_node.AssistantAgent", side_effect=agents),
+    ):
+        first = SearchNode()._get_search_agent()
+        second = SearchNode()._get_search_agent()
+
+    assert first is agents[0]
+    assert second is agents[1]
+    assert first is not second
 
 
 @pytest.mark.asyncio

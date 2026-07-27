@@ -231,7 +231,7 @@ class ParseNode(BaseNode[ParseInput, ParseOutput]):
     def _get_model_client(self):
         """懒加载 LLM 客户端。"""
         if self._model_client is None:
-            self._model_client = create_model_client("parse_node")
+            self._model_client = create_model_client()
         return self._model_client
 
 

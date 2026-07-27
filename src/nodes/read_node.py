@@ -11,7 +11,7 @@ from autogen_core import Image as AutoGenImage
 from autogen_core.models import SystemMessage, UserMessage
 from pydantic import ValidationError
 
-from src.core.model_client import create_reading_model_client
+from src.core.model_client import create_model_client
 from src.core.prompts import read_agent_prompt, verify_prompt
 from src.core.state_models import (
     BackToFrontData,
@@ -609,7 +609,7 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
     def _get_model_client(self):
         """懒加载 LLM 客户端。"""
         if self._model_client is None:
-            self._model_client = create_reading_model_client()
+            self._model_client = create_model_client()
         return self._model_client
 
 

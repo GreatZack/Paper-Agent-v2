@@ -1,17 +1,26 @@
 # Paper-Agent-v2 模型配置
-# 所有节点统一使用 default-model，不再区分 search-model / reading-model
+# 所有节点统一使用同一个 OpenAI 兼容纯文本模型
 
-default-model:
-  model-provider: mimo
-  model: mimo-v2.5
-  # api_key 可以直接填写，也可以引用 .env 中的环境变量名
-  api_key: ${MIMO_API_KEY}
-  base_url: https://opencode.ai/zen/go/v1
+model:
+  name: ${MODEL_NAME}
+  api_key: ${MODEL_API_KEY}
+  base_url: ${MODEL_BASE_URL}
+  capabilities:
+    vision: false
+    function_calling: true
+    json_output: true
+    structured_output: true
+    family: unknown
 
 # 搜索节点配置（预留字段，当前未全部启用）
 search_node:
   # 是否使用 LLM 生成查询条件
   use_llm: true
+  # 候选池与最终返回数量分离
+  candidate_pool_min: 20
+  candidate_pool_multiplier: 5
+  candidate_pool_max: 50
+  filter_batch_size: 20
   # 是否下载 PDF
   download_pdf: true
   # PDF 下载目录
@@ -27,14 +36,11 @@ search_node:
 # 阅读节点配置
 read_node:
   # 并发处理论文数
-  concurrency: 5
+  concurrency: 2
   # 超过此 token 数触发 section 切块
   max_tokens_threshold: 90000
-  # 模型配置（可选，默认复用 default-model）
-  model-provider: mimo
-  model: mimo-v2.5
-  # 多模态图文提取
-  use_images: true
+  # Render 免费实例使用纯文本模式，保留图片参数以便未来重新启用
+  use_images: false
   image:
     detail: low
     dpi: 150
@@ -49,4 +55,4 @@ read_node:
       - limitations
 
 # 全局默认配置
-default_max_papers: 20
+default_max_papers: 1

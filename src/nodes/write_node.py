@@ -328,7 +328,7 @@ class WriteNode(BaseNode[WriteInput, WriteOutput]):
 
     def _get_model_client(self):
         if self._model_client is None:
-            self._model_client = create_model_client("write_node")
+            self._model_client = create_model_client()
         return self._model_client
 
 

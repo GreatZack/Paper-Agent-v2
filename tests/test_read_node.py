@@ -1,19 +1,18 @@
 """read_node 测试：离线单元 + 端到端单篇。"""
 
 import asyncio
-import json
 import os
+
 import pytest
 
 from src.core.state_models import (
     KeyInformation,
+    ReadingStrategy,
     ReadInput,
     ReadOutput,
-    ReadingStrategy,
     SearchResult,
 )
 from src.nodes.read_node import ReadNode
-
 
 # ── fixture ────────────────────────────────────────────────────
 
@@ -27,6 +26,8 @@ def node():
 def sample_search_result():
     """取一个真实 PDF 构造 SearchResult。"""
     papers_dir = "data/papers"
+    if not os.path.isdir(papers_dir):
+        pytest.skip("data/papers/ 目录不存在")
     pdfs = [f for f in os.listdir(papers_dir) if f.endswith(".pdf")]
     if not pdfs:
         pytest.skip("data/papers/ 中没有 PDF 文件")
