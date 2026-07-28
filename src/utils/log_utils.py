@@ -2,7 +2,11 @@ import logging
 from pathlib import Path
 
 
-def setup_logger(name: str = "project", log_file: str = "project.log", level: int = logging.DEBUG) -> logging.Logger:
+def setup_logger(
+    name: str = "project",
+    log_file: str = "project.log",
+    level: int = logging.DEBUG,
+) -> logging.Logger:
     """设置日志记录器。"""
     # 创建日志目录（如果不存在）
     log_dir = Path("output/log")
@@ -16,6 +20,7 @@ def setup_logger(name: str = "project", log_file: str = "project.log", level: in
     if logger.handlers:
         return logger
     logger.setLevel(level)
+    logger.propagate = False
 
     # 创建文件处理器
     file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
@@ -26,7 +31,9 @@ def setup_logger(name: str = "project", log_file: str = "project.log", level: in
     console_handler.setLevel(level)
 
     # 创建日志格式
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
 

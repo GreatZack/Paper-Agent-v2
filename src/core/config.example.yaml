@@ -27,7 +27,7 @@ search_node:
 
 read_node:
   concurrency: 2
-  max_tokens_threshold: 90000
+  max_tokens_threshold: 25000
   use_images: false
   image:
     detail: low

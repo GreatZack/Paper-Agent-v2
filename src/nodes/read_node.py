@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import fitz
 import pymupdf4llm
-from PIL import Image as PILImage
 from autogen_core import Image as AutoGenImage
 from autogen_core.models import SystemMessage, UserMessage
+from PIL import Image as PILImage
 from pydantic import ValidationError
 
 from src.core.model_client import create_model_client
@@ -17,9 +17,9 @@ from src.core.state_models import (
     BackToFrontData,
     ExecutionState,
     KeyInformation,
+    ReadingStrategy,
     ReadInput,
     ReadOutput,
-    ReadingStrategy,
     State,
     VerificationItem,
     VerifyResult,
@@ -49,7 +49,7 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         super().__init__(config)
         cfg = self.config or {}
         self.concurrency: int = int(cfg.get("concurrency", 5))
-        self.max_tokens_threshold: int = int(cfg.get("max_tokens_threshold", 90000))
+        self.max_tokens_threshold: int = int(cfg.get("max_tokens_threshold", 25000))
 
         image_cfg = cfg.get("image", {}) or {}
         self.use_images: bool = bool(cfg.get("use_images", True))
@@ -71,7 +71,9 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             self.logger.info("[read_node] 无文档，跳过处理")
             return ReadOutput(key_info=[], status="completed", failed_paper_ids=[])
 
-        self.logger.info(f"[read_node] 开始处理 {len(documents)} 篇论文，并发={self.concurrency}")
+        self.logger.info(
+            f"[read_node] 开始处理 {len(documents)} 篇论文，并发={self.concurrency}"
+        )
 
         sem = asyncio.Semaphore(self.concurrency)
 
@@ -134,7 +136,9 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                 for group_texts, group_images in page_groups:
                     group_full = "\n\n".join(group_texts)
                     result = await self._call_llm_extract(
-                        group_full, strategy, paper,
+                        group_full,
+                        strategy,
+                        paper,
                         page_texts=group_texts,
                         page_images=group_images,
                     )
@@ -145,8 +149,10 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                 return self._merge_chunk_results(chunk_results)
             else:
                 if self._estimate_tokens(full_text) > self.max_tokens_threshold:
-                    self.logger.info(f"[read_node] {paper_id}: 论文过长，按 section 切块")
-                    chunks = self._split_by_section(full_text)
+                    self.logger.info(
+                        f"[read_node] {paper_id}: 论文过长，按 section 切块"
+                    )
+                    chunks = self._chunk_text_for_model(full_text)
                     chunk_results = []
                     for chunk in chunks:
                         result = await self._call_llm_extract(chunk, strategy, paper)
@@ -202,7 +208,8 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             page_images = self._render_pdf_pages(pdf_path)
             if len(page_texts) != len(page_images):
                 self.logger.warning(
-                    f"page_texts({len(page_texts)}) != page_images({len(page_images)}), truncating"
+                    f"page_texts({len(page_texts)}) != "
+                    f"page_images({len(page_images)}), truncating"
                 )
                 min_count = min(len(page_texts), len(page_images))
                 page_texts = page_texts[:min_count]
@@ -265,6 +272,44 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             sub_chunks.append("\n".join(current))
         return sub_chunks if sub_chunks else [text]
 
+    def _chunk_text_for_model(self, md_text: str) -> List[str]:
+        """按章节切分并重新打包，确保每个模型请求不超过 token 阈值。"""
+        sections = self._split_by_section(md_text)
+        pieces: List[str] = []
+        max_chars = max(4, self.max_tokens_threshold * 4)
+
+        for section in sections:
+            if self._estimate_tokens(section) <= self.max_tokens_threshold:
+                pieces.append(section)
+                continue
+            for start in range(0, len(section), max_chars):
+                pieces.append(section[start : start + max_chars])
+
+        chunks: List[str] = []
+        current: List[str] = []
+        current_tokens = 0
+        for piece in pieces:
+            piece_tokens = max(1, self._estimate_tokens(piece))
+            if current and current_tokens + piece_tokens > self.max_tokens_threshold:
+                chunks.append("\n\n".join(current))
+                current = []
+                current_tokens = 0
+            current.append(piece)
+            current_tokens += piece_tokens
+
+        if current:
+            chunks.append("\n\n".join(current))
+        return chunks or [md_text]
+
+    @staticmethod
+    def _format_authors(authors: List[str], limit: int = 20) -> str:
+        """限制超长作者列表，避免其重复占用模型上下文。"""
+        if not authors:
+            return "未知"
+        visible = ", ".join(authors[:limit])
+        remaining = len(authors) - limit
+        return f"{visible}（另有 {remaining} 位作者）" if remaining > 0 else visible
+
     # ── LLM 提取 ──────────────────────────────────────────────
 
     async def _call_llm_extract(
@@ -280,7 +325,9 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         client = self._get_model_client()
 
         if self.use_images and page_texts and page_images:
-            content = self._build_multimodal_content(strategy, paper, page_texts, page_images)
+            content = self._build_multimodal_content(
+                strategy, paper, page_texts, page_images
+            )
         else:
             content = self._build_user_prompt(text, strategy, paper)
 
@@ -322,22 +369,34 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         title = getattr(paper, "title", "")
         authors = getattr(paper, "authors", [])
         summary = getattr(paper, "summary", "")
-        authors_str = ", ".join(authors) if authors else "未知"
-        focus_areas = ", ".join(strategy.focus_areas) if strategy.focus_areas else "method, result, limitation"
+        authors_str = self._format_authors(authors)
+        focus_areas = (
+            ", ".join(strategy.focus_areas)
+            if strategy.focus_areas
+            else "method, result, limitation"
+        )
 
         depth = getattr(strategy, "depth", "medium")
         depth_instruction = {
             "shallow": "做简要提取，每个字段 2-3 句话即可。",
-            "medium": "做中等详细度的提取，保留关键技术细节和主要实验数据，每个字段 5-10 句话。",
+            "medium": (
+                "做中等详细度的提取，保留关键技术细节和主要实验数据，"
+                "每个字段 5-10 句话。"
+            ),
             "deep": (
                 "做深度提取，把这篇论文当作唯一的信息来源。每个字段必须详尽：\n"
                 "- core_problem: 说清楚问题的背景、现有方法的不足、本文的目标\n"
-                "- key_methodology: 完整描述技术架构（所有模块）、训练策略、使用的数据集、超参数、评估协议\n"
-                "- main_results: 逐实验、逐数据集、逐指标列出所有数值，不要省略任何一行结果表格的数据\n"
+                "- key_methodology: 完整描述技术架构（所有模块）、训练策略、"
+                "使用的数据集、超参数、评估协议\n"
+                "- main_results: 逐实验、逐数据集、逐指标列出所有数值，"
+                "不要省略任何一行结果表格的数据\n"
                 "- limitations: 逐一列出每个局限，说明为什么存在、影响是什么\n"
                 "- contributions: 列出所有贡献点"
             ),
-        }.get(depth, "做中等详细度的提取，保留关键技术细节和主要实验数据，每个字段 5-10 句话。")
+        }.get(
+            depth,
+            "做中等详细度的提取，保留关键技术细节和主要实验数据，每个字段 5-10 句话。",
+        )
 
         return (
             f"## 论文元信息\n"
@@ -396,27 +455,37 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             chunks.append((cur_texts, cur_imgs))
         return chunks
 
-    def _build_user_prompt(
-        self, text: str, strategy: ReadingStrategy, paper
-    ) -> str:
+    def _build_user_prompt(self, text: str, strategy: ReadingStrategy, paper) -> str:
         """构造 LLM 用户消息。"""
         title = getattr(paper, "title", "")
         authors = getattr(paper, "authors", [])
         summary = getattr(paper, "summary", "")
-        authors_str = ", ".join(authors) if authors else "未知"
-        focus_areas = ", ".join(strategy.focus_areas) if strategy.focus_areas else "method, result, limitation"
+        authors_str = self._format_authors(authors)
+        focus_areas = (
+            ", ".join(strategy.focus_areas)
+            if strategy.focus_areas
+            else "method, result, limitation"
+        )
 
         depth = getattr(strategy, "depth", "medium")
         depth_instruction = {
             "shallow": "做简要提取，每个字段 2-3 句话即可。",
-            "medium": "做中等详细度的提取，保留关键技术细节和主要实验数据，每个字段 5-10 句话。",
+            "medium": (
+                "做中等详细度的提取，保留关键技术细节和主要实验数据，"
+                "每个字段 5-10 句话。"
+            ),
             "deep": "做深度提取，把这篇论文当作唯一的信息来源。每个字段必须详尽：\n"
-                    "- core_problem: 说清楚问题的背景、现有方法的不足、本文的目标\n"
-                    "- key_methodology: 完整描述技术架构（所有模块）、训练策略、使用的数据集、超参数、评估协议\n"
-                    "- main_results: 逐实验、逐数据集、逐指标列出所有数值，不要省略任何一行结果表格的数据\n"
-                    "- limitations: 逐一列出每个局限，说明为什么存在、影响是什么\n"
-                    "- contributions: 列出所有贡献点",
-        }.get(depth, "做中等详细度的提取，保留关键技术细节和主要实验数据，每个字段 5-10 句话。")
+            "- core_problem: 说清楚问题的背景、现有方法的不足、本文的目标\n"
+            "- key_methodology: 完整描述技术架构（所有模块）、训练策略、"
+            "使用的数据集、超参数、评估协议\n"
+            "- main_results: 逐实验、逐数据集、逐指标列出所有数值，"
+            "不要省略任何一行结果表格的数据\n"
+            "- limitations: 逐一列出每个局限，说明为什么存在、影响是什么\n"
+            "- contributions: 列出所有贡献点",
+        }.get(
+            depth,
+            "做中等详细度的提取，保留关键技术细节和主要实验数据，每个字段 5-10 句话。",
+        )
 
         return f"""## 论文元信息
 - 标题：{title}
@@ -448,7 +517,11 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                 parsed[field] = "；".join(parsed[field])
         # contributions 必须是 list，如果 LLM 返回了 string，拆开
         if "contributions" in parsed and isinstance(parsed["contributions"], str):
-            parts = [p.strip() for p in re.split(r"[；;]", parsed["contributions"]) if p.strip()]
+            parts = [
+                p.strip()
+                for p in re.split(r"[；;]", parsed["contributions"])
+                if p.strip()
+            ]
             parsed["contributions"] = parts if parts else [parsed["contributions"]]
         return parsed
 
@@ -467,7 +540,8 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
 
         # core_problem: 优先 Abstract / Introduction
         core_problem = self._first_non_empty(
-            chunk_results, "core_problem",
+            chunk_results,
+            "core_problem",
             preferred_sections=["abstract", "introduction"],
         )
 
@@ -479,7 +553,8 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
 
         # limitations: 优先 Discussion / Conclusion
         limitations = self._first_non_empty(
-            chunk_results, "limitations",
+            chunk_results,
+            "limitations",
             preferred_sections=["discussion", "conclusion"],
         )
 
@@ -579,15 +654,18 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             items = []
             for field in ("key_methodology", "main_results", "limitations"):
                 field_result = parsed.get(field, {})
-                items.append(VerificationItem(
-                    field=field,
-                    verified=bool(field_result.get("verified", False)),
-                    exact_quote=str(field_result.get("exact_quote", "")),
-                    reason=str(field_result.get("reason", "")),
-                    original_claim=str(claims_to_verify.get(field, "")),
-                ))
+                items.append(
+                    VerificationItem(
+                        field=field,
+                        verified=bool(field_result.get("verified", False)),
+                        exact_quote=str(field_result.get("exact_quote", "")),
+                        reason=str(field_result.get("reason", "")),
+                        original_claim=str(claims_to_verify.get(field, "")),
+                    )
+                )
 
             from datetime import datetime
+
             verify_result = VerifyResult(
                 paper_id=paper_id,
                 items=items,
@@ -595,9 +673,8 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                 retry_count=0,
                 verified_at=datetime.now().isoformat(),
             )
-            self.logger.info(
-                f"[read_node] {paper_id}: 验证{'通过' if verify_result.passed else '不通过'}"
-            )
+            verification_status = "通过" if verify_result.passed else "不通过"
+            self.logger.info(f"[read_node] {paper_id}: 验证{verification_status}")
             return verify_result
 
         except Exception as e:
@@ -624,7 +701,9 @@ async def read_node(state: State) -> State:
     try:
         current_state.current_step = ExecutionState.READING
         await state_queue.put(
-            BackToFrontData(step=ExecutionState.READING, state="initializing", data=None)
+            BackToFrontData(
+                step=ExecutionState.READING, state="initializing", data=None
+            )
         )
 
         read_config = current_state.config.get("read_node", {})
@@ -636,12 +715,18 @@ async def read_node(state: State) -> State:
         # ── 筛选尚未通过验证的论文 ──
         existing_results = current_state.verify_results or {}
         papers_to_process = [
-            doc for doc in current_state.search_output.results
-            if not (doc.paper_id in existing_results and existing_results[doc.paper_id].passed)
+            doc
+            for doc in current_state.search_output.results
+            if not (
+                doc.paper_id in existing_results
+                and existing_results[doc.paper_id].passed
+            )
         ]
 
         if papers_to_process:
-            focus_areas = read_config.get("focus_areas", ["method", "result", "limitation"])
+            focus_areas = read_config.get(
+                "focus_areas", ["method", "result", "limitation"]
+            )
             read_input = ReadInput(
                 documents=papers_to_process,
                 reading_strategy=ReadingStrategy(
@@ -680,8 +765,12 @@ async def read_node(state: State) -> State:
 
         # ── 统计状态 ──
         total_papers = len(current_state.search_output.results)
-        verified_count = sum(1 for vr in current_state.verify_results.values() if vr.passed)
-        failed_verify = sum(1 for vr in current_state.verify_results.values() if not vr.passed)
+        verified_count = sum(
+            1 for vr in current_state.verify_results.values() if vr.passed
+        )
+        failed_verify = sum(
+            1 for vr in current_state.verify_results.values() if not vr.passed
+        )
         extract_failed = len(current_state.read_output.failed_paper_ids)
 
         await state_queue.put(

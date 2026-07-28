@@ -1,5 +1,5 @@
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -86,20 +86,54 @@ async def test_search_papers_success(searcher):
     )
     fake_client = _make_mock_client([fake_result])
 
-    with patch("src.tasks.paper_search.arxiv.Client", return_value=fake_client):
-        papers = await searcher.search_papers(query='(all:"ROS2" AND all:"automated driving")', max_results=5)
+    with patch(
+        "src.tasks.paper_search.arxiv.Client", return_value=fake_client
+    ) as client_cls:
+        papers = await searcher.search_papers(
+            query='(all:"ROS2" AND all:"automated driving")', max_results=5
+        )
 
     assert len(papers) == 1
     assert papers[0]["paper_id"] == "2411.11607v2"
     fake_client.results.assert_called_once()
+    client_cls.assert_called_once_with(
+        page_size=5,
+        delay_seconds=5.0,
+        num_retries=0,
+    )
+    assert fake_client._session.timeout == 15.0
+
+
+@pytest.mark.asyncio
+async def test_search_papers_retries_http_429(searcher):
+    fake_result = FakeResult(title="Recovered Paper")
+    limited_client = _make_mock_client([])
+    limited_client.results.side_effect = Exception("HTTP 429")
+    recovered_client = _make_mock_client([fake_result])
+
+    with (
+        patch(
+            "src.tasks.paper_search.arxiv.Client",
+            side_effect=[limited_client, recovered_client],
+        ),
+        patch("src.tasks.paper_search.asyncio.sleep", new=AsyncMock()) as sleep,
+    ):
+        papers = await searcher.search_papers(query='all:"test"', max_results=20)
+
+    assert [paper["title"] for paper in papers] == ["Recovered Paper"]
+    sleep.assert_awaited_once_with(10)
 
 
 @pytest.mark.asyncio
 async def test_search_papers_with_date_range(searcher):
-    fake_result = FakeResult(paper_id="2307.06258v1", title="Safe AD", published=datetime(2023, 7, 12))
+    fake_result = FakeResult(
+        paper_id="2307.06258v1", title="Safe AD", published=datetime(2023, 7, 12)
+    )
     fake_client = _make_mock_client([fake_result])
 
-    with patch("src.tasks.paper_search.arxiv.Client", return_value=fake_client) as mock_client_cls:
+    with patch(
+        "src.tasks.paper_search.arxiv.Client", return_value=fake_client
+    ) as mock_client_cls:
         papers = await searcher.search_papers(
             query='all:"automated driving" AND submittedDate:[20230101 TO 20231231]',
             max_results=10,
@@ -115,21 +149,27 @@ async def test_search_papers_empty_results(searcher):
     fake_client = _make_mock_client([])
 
     with patch("src.tasks.paper_search.arxiv.Client", return_value=fake_client):
-        papers = await searcher.search_papers(query='all:"nonexistent topic"', max_results=10)
+        papers = await searcher.search_papers(
+            query='all:"nonexistent topic"', max_results=10
+        )
 
     assert papers == []
 
 
 @pytest.mark.asyncio
 async def test_search_papers_search_object_failure(searcher):
-    with patch("src.tasks.paper_search.arxiv.Search", side_effect=Exception("arxiv error")):
+    with patch(
+        "src.tasks.paper_search.arxiv.Search", side_effect=Exception("arxiv error")
+    ):
         papers = await searcher.search_papers(query='all:"test"', max_results=10)
     assert papers == []
 
 
 @pytest.mark.asyncio
 async def test_search_by_topic(searcher):
-    fake_result = FakeResult(paper_id="1234.56789", title="Topic Paper", published=datetime(2024, 1, 1))
+    fake_result = FakeResult(
+        paper_id="1234.56789", title="Topic Paper", published=datetime(2024, 1, 1)
+    )
     fake_client = _make_mock_client([fake_result])
 
     with patch("src.tasks.paper_search.arxiv.Client", return_value=fake_client):
@@ -141,7 +181,9 @@ async def test_search_by_topic(searcher):
 
 @pytest.mark.asyncio
 async def test_search_by_author(searcher):
-    fake_result = FakeResult(paper_id="1234.56789", title="Author Paper", published=datetime(2024, 1, 1))
+    fake_result = FakeResult(
+        paper_id="1234.56789", title="Author Paper", published=datetime(2024, 1, 1)
+    )
     fake_client = _make_mock_client([fake_result])
 
     with patch("src.tasks.paper_search.arxiv.Client", return_value=fake_client):

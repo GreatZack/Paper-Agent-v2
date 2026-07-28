@@ -68,3 +68,68 @@ async def test_completed_pipeline_sends_terminal_state_then_report():
         "state": "completed",
         "data": "final report",
     }
+
+
+@pytest.mark.asyncio
+async def test_long_pipeline_sends_heartbeat_before_completion():
+    class SlowOrchestrator:
+        def __init__(self, state_queue, config):
+            self.state_queue = state_queue
+
+        async def start(self, query, max_papers):
+            await asyncio.sleep(0.03)
+            await self.state_queue.put(
+                BackToFrontData(
+                    step=ExecutionState.COMPLETED,
+                    state="finished",
+                    data=None,
+                )
+            )
+            return SimpleNamespace(
+                current_step=ExecutionState.COMPLETED,
+                write_output=SimpleNamespace(generated_text="final report"),
+            )
+
+    websocket = SimpleNamespace(send_json=AsyncMock())
+
+    with (
+        patch("backend.pipeline_handler.WorkflowOrchestrator", SlowOrchestrator),
+        patch("backend.pipeline_handler.HEARTBEAT_INTERVAL_SECONDS", 0.01),
+    ):
+        await run_pipeline("test", 1, websocket)
+
+    payloads = [call.args[0] for call in websocket.send_json.await_args_list]
+    assert {
+        "step": "heartbeat",
+        "state": "running",
+        "data": "任务仍在处理中",
+    } in payloads
+    assert payloads[-1]["step"] == "report"
+
+
+@pytest.mark.asyncio
+async def test_disconnected_websocket_cancels_pipeline_cleanly():
+    cancelled = asyncio.Event()
+
+    class SlowOrchestrator:
+        def __init__(self, state_queue, config):
+            pass
+
+        async def start(self, query, max_papers):
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    websocket = SimpleNamespace(
+        send_json=AsyncMock(side_effect=RuntimeError("transport closed"))
+    )
+
+    with (
+        patch("backend.pipeline_handler.WorkflowOrchestrator", SlowOrchestrator),
+        patch("backend.pipeline_handler.HEARTBEAT_INTERVAL_SECONDS", 0.01),
+    ):
+        await asyncio.wait_for(run_pipeline("test", 1, websocket), timeout=0.2)
+
+    assert cancelled.is_set()

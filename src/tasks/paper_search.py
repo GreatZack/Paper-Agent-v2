@@ -1,13 +1,27 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import arxiv
 import httpx
+import requests
 
 from src.utils.log_utils import setup_logger
 
 logger = setup_logger(__name__)
+
+
+class _TimeoutSession(requests.Session):
+    """为 arxiv.py 缺少超时的同步请求补充读取超时。"""
+
+    def __init__(self, timeout: float = 15.0):
+        super().__init__()
+        self.timeout = timeout
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", self.timeout)
+        return super().request(method, url, **kwargs)
 
 
 class PaperSearcher:
@@ -26,7 +40,8 @@ class PaperSearcher:
         """使用完整 arXiv 查询表达式搜索论文。
 
         Args:
-            query: 完整的 arXiv 查询表达式，如 '(all:"LLM" AND all:"autonomous driving")'
+            query: 完整的 arXiv 查询表达式，
+                如 '(all:"LLM" AND all:"autonomous driving")'
             max_results: 最大返回结果数量。
             sort_by: 排序方式。
             sort_order: 排序顺序。
@@ -39,7 +54,12 @@ class PaperSearcher:
                 logger.warning("查询表达式为空，跳过 arXiv 搜索")
                 return []
 
-            logger.info(f"开始搜索论文: query='{query}', max_results={max_results}, sort_by={sort_by}")
+            logger.info(
+                "开始搜索论文: query=%r, max_results=%d, sort_by=%s",
+                query,
+                max_results,
+                sort_by,
+            )
 
             try:
                 search = arxiv.Search(
@@ -52,10 +72,35 @@ class PaperSearcher:
                 logger.error(f"创建 arxiv 搜索对象失败: {e}")
                 return []
 
-            client = arxiv.Client()
-            papers = self.format_papers_list(client.results(search))
-            logger.info(f"论文搜索完成，共找到 {len(papers)} 篇论文")
-            return papers
+            page_size = max(1, min(max_results, 20))
+            for attempt in range(3):
+                try:
+                    client = arxiv.Client(
+                        page_size=page_size,
+                        delay_seconds=5.0,
+                        num_retries=0,
+                    )
+                    client._session = _TimeoutSession(timeout=15.0)
+                    papers = await asyncio.to_thread(
+                        self.format_papers_list, client.results(search)
+                    )
+                    logger.info(f"论文搜索完成，共找到 {len(papers)} 篇论文")
+                    return papers
+                except Exception as e:
+                    is_retryable = "429" in str(e) or isinstance(
+                        e,
+                        (requests.Timeout, requests.ConnectionError),
+                    )
+                    if not is_retryable or attempt == 2:
+                        raise
+                    retry_delay = 10 * (2**attempt)
+                    logger.warning(
+                        "arXiv 请求暂时失败，将在 %d 秒后重试 (%d/3): %s",
+                        retry_delay,
+                        attempt + 1,
+                        e,
+                    )
+                    await asyncio.sleep(retry_delay)
         except Exception as e:
             logger.error(f"论文搜索失败: {e}")
             raise
@@ -67,7 +112,9 @@ class PaperSearcher:
         recent_days: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """按主题搜索最近的论文。"""
-        logger.info(f"按主题搜索论文: topic='{topic}', limit={limit}, recent_days={recent_days}")
+        logger.info(
+            f"按主题搜索论文: topic='{topic}', limit={limit}, recent_days={recent_days}"
+        )
         escaped_topic = topic.replace("\\", "\\\\").replace('"', '\\"')
         query = f'all:"{escaped_topic}"'
 
@@ -149,7 +196,9 @@ class PaperSearcher:
             "authors": [author.name for author in result.authors],
             "summary": result.summary,
             "published": published_year,
-            "published_date": result.published.isoformat() if result.published else None,
+            "published_date": result.published.isoformat()
+            if result.published
+            else None,
             "url": result.entry_id,
             "pdf_url": result.pdf_url,
             "primary_category": result.primary_category,
@@ -157,9 +206,7 @@ class PaperSearcher:
             "doi": result.doi if hasattr(result, "doi") else None,
         }
 
-    def _format_date(
-        self, date: Union[str, datetime], end_of_day: bool = False
-    ) -> str:
+    def _format_date(self, date: Union[str, datetime], end_of_day: bool = False) -> str:
         """格式化日期为 arXiv API 支持的格式 YYYYMMDD0000 或 YYYYMMDD2359。"""
         suffix = "2359" if end_of_day else "0000"
         if isinstance(date, datetime):
@@ -192,6 +239,7 @@ class PaperSearcher:
                     continue
             try:
                 from dateutil import parser
+
                 parsed_date = parser.parse(date)
                 return parsed_date.strftime(f"%Y%m%d{suffix}")
             except Exception:

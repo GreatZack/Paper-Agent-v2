@@ -16,10 +16,17 @@ from src.nodes.read_node import ReadNode
 
 # ── fixture ────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def node():
     """默认配置的 ReadNode。"""
-    return ReadNode({"concurrency": 2, "max_tokens_threshold": 90000})
+    return ReadNode(
+        {
+            "concurrency": 2,
+            "max_tokens_threshold": 90000,
+            "use_images": False,
+        }
+    )
 
 
 @pytest.fixture
@@ -43,6 +50,7 @@ def sample_search_result():
 
 
 # ── 离线单元测试（不调 API）────────────────────────────────────
+
 
 class TestTokenEstimation:
     def test_english_text(self, node):
@@ -71,6 +79,26 @@ class TestSplitBySection:
         assert len(chunks) == 1
         assert "Plain text" in chunks[0]
 
+    def test_model_chunks_stay_within_threshold(self):
+        node = ReadNode({"max_tokens_threshold": 10})
+        md = "# Title\n\n## A\n" + "a" * 60 + "\n\n## B\n" + "b" * 60
+
+        chunks = node._chunk_text_for_model(md)
+
+        assert len(chunks) > 1
+        assert all(node._estimate_tokens(chunk) <= 10 for chunk in chunks)
+
+
+class TestAuthorFormatting:
+    def test_truncates_very_long_author_list(self, node):
+        authors = [f"Author {i}" for i in range(25)]
+
+        result = node._format_authors(authors)
+
+        assert "Author 19" in result
+        assert "Author 20" not in result
+        assert "另有 5 位作者" in result
+
 
 class TestStripJsonFence:
     def test_with_fence(self, node):
@@ -89,7 +117,8 @@ class TestStripJsonFence:
 class TestMergeChunkResults:
     def test_single_chunk(self, node):
         k = KeyInformation(
-            paper_id="p1", core_problem="test",
+            paper_id="p1",
+            core_problem="test",
             evidence_sections={"core_problem": "§1"},
         )
         result = node._merge_chunk_results([k])
@@ -97,11 +126,13 @@ class TestMergeChunkResults:
 
     def test_merge_prefers_abstract_for_core_problem(self, node):
         k1 = KeyInformation(
-            paper_id="p1", core_problem="",
+            paper_id="p1",
+            core_problem="",
             evidence_sections={"core_problem": "Introduction §1"},
         )
         k2 = KeyInformation(
-            paper_id="p1", core_problem="real problem",
+            paper_id="p1",
+            core_problem="real problem",
             evidence_sections={"core_problem": "Abstract"},
         )
         result = node._merge_chunk_results([k1, k2])
@@ -109,10 +140,12 @@ class TestMergeChunkResults:
 
     def test_merge_concat_results(self, node):
         k1 = KeyInformation(
-            paper_id="p1", main_results="result A",
+            paper_id="p1",
+            main_results="result A",
         )
         k2 = KeyInformation(
-            paper_id="p1", main_results="result B",
+            paper_id="p1",
+            main_results="result B",
         )
         result = node._merge_chunk_results([k1, k2])
         assert "result A" in result.main_results
@@ -127,24 +160,28 @@ class TestMergeChunkResults:
 
 # ── PDF 提取测试（调 pymupdf4llm，不调 LLM）──────────────────
 
+
 class TestExtractMarkdown:
     def test_extracts_valid_markdown(self, node, sample_search_result):
-        md = node._extract_markdown(sample_search_result.pdf_path)
+        md, pages, images = node._extract_pdf_content(sample_search_result.pdf_path)
         assert len(md) > 500
         assert "# " in md  # 至少有标题
+        assert pages
+        assert images == []
 
     def test_missing_pdf_raises(self, node):
         with pytest.raises(Exception):
-            node._extract_markdown("data/papers/nonexistent.pdf")
+            node._extract_pdf_content("data/papers/nonexistent.pdf")
 
 
 # ── 空文档处理 ─────────────────────────────────────────────────
 
+
 class TestEmptyDocuments:
     def test_empty_documents_returns_empty_output(self, node):
-        result = asyncio.run(node.process(
-            ReadInput(documents=[], reading_strategy=ReadingStrategy())
-        ))
+        result = asyncio.run(
+            node.process(ReadInput(documents=[], reading_strategy=ReadingStrategy()))
+        )
         assert isinstance(result, ReadOutput)
         assert result.key_info == []
         assert result.status == "completed"
@@ -152,19 +189,25 @@ class TestEmptyDocuments:
 
 # ── 失败路径（无 pdf_path）────────────────────────────────────
 
+
 class TestFailedPapers:
     def test_no_pdf_path_goes_to_failed(self, node):
         paper = SearchResult(
-            paper_id="no_pdf", title="No PDF", pdf_path=None,
+            paper_id="no_pdf",
+            title="No PDF",
+            pdf_path=None,
         )
-        result = asyncio.run(node.process(
-            ReadInput(documents=[paper], reading_strategy=ReadingStrategy())
-        ))
+        result = asyncio.run(
+            node.process(
+                ReadInput(documents=[paper], reading_strategy=ReadingStrategy())
+            )
+        )
         assert "no_pdf" in result.failed_paper_ids
         assert len(result.key_info) == 0
 
 
 # ── 端到端单篇测试（真调 Mimo API）─────────────────────────
+
 
 @pytest.mark.slow
 class TestEndToEnd:
