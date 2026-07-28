@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import arxiv
 from autogen_agentchat.agents import AssistantAgent
 
-from src.core.model_client import create_search_model_client
+from src.core.model_client import create_model_client
 from src.core.prompts import search_agent_prompt
 from src.core.state_models import (
     BackToFrontData,
@@ -25,28 +25,14 @@ from src.utils.log_utils import setup_logger
 logger = setup_logger(__name__)
 
 # 允许的 arXiv 字段前缀白名单（小写，用于 query 验证）
-_ALLOWED_FIELD_PREFIXES = {"all:", "ti:", "abs:", "au:", "submitteddate:", "submitted_date:"}
-
-_search_agent: Optional[AssistantAgent] = None
-
-
-def get_search_agent() -> Optional[AssistantAgent]:
-    """懒加载并返回搜索 Agent；配置缺失时返回 None。"""
-    global _search_agent
-    if _search_agent is not None:
-        return _search_agent
-    try:
-        model_client = create_search_model_client()
-        _search_agent = AssistantAgent(
-            name="search_agent",
-            model_client=model_client,
-            system_message=search_agent_prompt,
-        )
-        return _search_agent
-    except Exception as e:
-        logger.warning(f"创建搜索模型客户端失败，将使用输入关键词直接搜索: {e}")
-        _search_agent = None
-        return None
+_ALLOWED_FIELD_PREFIXES = {
+    "all:",
+    "ti:",
+    "abs:",
+    "au:",
+    "submitteddate:",
+    "submitted_date:",
+}
 
 
 class SearchNode(BaseNode[SearchInput, SearchOutput]):
@@ -61,7 +47,63 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         self.use_llm = self.config.get("use_llm", True)
         self.download_pdf = self.config.get("download_pdf", False)
         self.pdf_download_dir = self.config.get("pdf_download_dir", "data/papers")
+        self.candidate_pool_min = max(1, int(self.config.get("candidate_pool_min", 20)))
+        self.candidate_pool_multiplier = max(
+            1, int(self.config.get("candidate_pool_multiplier", 5))
+        )
+        self.candidate_pool_max = max(
+            self.candidate_pool_min,
+            int(self.config.get("candidate_pool_max", 50)),
+        )
+        self.filter_batch_size = max(1, int(self.config.get("filter_batch_size", 20)))
         self.paper_searcher = PaperSearcher()
+        self._search_agent: Optional[AssistantAgent] = None
+        self._search_model_client = None
+
+    def _get_search_agent(self) -> Optional[AssistantAgent]:
+        """为当前 SearchNode 请求懒加载独立的查询 Agent。"""
+        if self._search_agent is not None:
+            return self._search_agent
+        try:
+            self._search_model_client = create_model_client()
+            self._search_agent = AssistantAgent(
+                name="search_agent",
+                model_client=self._search_model_client,
+                system_message=search_agent_prompt,
+            )
+            return self._search_agent
+        except Exception as e:
+            self.logger.warning(f"创建搜索模型客户端失败: {e}")
+            self._search_agent = None
+            self._search_model_client = None
+            return None
+
+    async def close(self) -> None:
+        """关闭当前请求创建的模型客户端。"""
+        if self._search_model_client is not None:
+            await self._search_model_client.close()
+            self._search_model_client = None
+            self._search_agent = None
+
+    def _candidate_count(self, target_count: int) -> int:
+        """根据最终目标数量计算 arXiv 候选池大小。"""
+        return min(
+            self.candidate_pool_max,
+            max(
+                self.candidate_pool_min,
+                max(1, target_count) * self.candidate_pool_multiplier,
+            ),
+        )
+
+    def _sort_criterion(self, user_request: str) -> arxiv.SortCriterion:
+        """选择 arXiv 排序策略；仅明确要求最新时按提交时间排序。"""
+        wants_latest = bool(
+            re.search(r"最新|latest|newest", user_request or "", re.IGNORECASE)
+        )
+        configured = str(self.config.get("default_sort_by", "relevance")).lower()
+        if wants_latest or configured == "submitted_date":
+            return arxiv.SortCriterion.SubmittedDate
+        return arxiv.SortCriterion.Relevance
 
     @staticmethod
     def _validate_query(query: str) -> bool:
@@ -88,14 +130,14 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
             return False
 
         # 提取并验证字段前缀
-        prefixes = re.findall(r'(?<![a-zA-Z])[a-zA-Z]+:', query)
+        prefixes = re.findall(r"(?<![a-zA-Z])[a-zA-Z]+:", query)
         for p in prefixes:
             if p.lower() not in _ALLOWED_FIELD_PREFIXES:
                 logger.warning(f"查询表达式中包含不允许的字段前缀: {p}")
                 return False
 
         # 禁止控制字符（arXiv API 会拒绝）
-        if re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', query):
+        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", query):
             return False
 
         return True
@@ -111,17 +153,18 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         query_keywords = list(input_data.query_keywords or [])
         start_date = input_data.search_scope.start_date
         end_date = input_data.search_scope.end_date
-        max_results = input_data.search_scope.max_results
+        target_count = max(1, input_data.search_scope.max_results)
+        candidate_count = self._candidate_count(target_count)
         max_retries = self.config.get("query_retry_limit", 3)
 
         # ── 阶段 1：用 LLM 生成完整查询表达式（带验证 + 重试） ──
         arxiv_query: Optional[str] = None
         if input_data.user_request and self.use_llm:
-            agent = get_search_agent()
+            agent = self._get_search_agent()
             if agent is None:
                 raise ValueError(
                     "LLM 搜索 Agent 初始化失败，无法生成查询表达式。"
-                    "请检查 search-model 配置或设置 use_llm=False 使用关键词搜索。"
+                    "请检查统一 model 配置或设置 use_llm=False 使用关键词搜索。"
                 )
             last_error: Optional[str] = None
             for attempt in range(1, max_retries + 1):
@@ -138,44 +181,46 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
                     elif generated:
                         last_error = f"生成的查询表达式不合法: {generated}"
                         self.logger.warning(
-                            f"[{self.name}] {last_error}，重试 ({attempt}/{max_retries})"
+                            f"[{self.name}] {last_error}，"
+                            f"重试 ({attempt}/{max_retries})"
                         )
                     else:
                         last_error = "LLM 返回了空查询"
                         self.logger.warning(
-                            f"[{self.name}] {last_error}，重试 ({attempt}/{max_retries})"
+                            f"[{self.name}] {last_error}，"
+                            f"重试 ({attempt}/{max_retries})"
                         )
                 except Exception as e:
                     last_error = str(e)
                     self.logger.warning(
-                        f"[{self.name}] LLM 查询生成异常: {e}，重试 ({attempt}/{max_retries})"
+                        f"[{self.name}] LLM 查询生成异常: {e}，"
+                        f"重试 ({attempt}/{max_retries})"
                     )
 
             if arxiv_query is None:
                 raise ValueError(
-                    f"LLM 无法生成有效的查询表达式（重试 {max_retries} 次后放弃）: {last_error}"
+                    "LLM 无法生成有效的查询表达式"
+                    f"（重试 {max_retries} 次后放弃）: {last_error}"
                 )
 
         # ── 阶段 2：LLM 不可用时（use_llm=False 或 agent 初始化失败） ──
         else:
             if not query_keywords:
                 raise ValueError("没有可用的搜索关键词")
-            escaped = [q.replace("\\", "\\\\").replace('"', '\\"') for q in query_keywords]
+            escaped = [
+                q.replace("\\", "\\\\").replace('"', '\\"') for q in query_keywords
+            ]
             arxiv_query = "(" + " AND ".join(f'all:"{q}"' for q in escaped) + ")"
             self.logger.info(f"[{self.name}] 关键词拼装查询: {arxiv_query}")
 
         # ── 阶段 3：排序策略 ──
-        if start_date is None:
-            sort_by = arxiv.SortCriterion.SubmittedDate
-            sort_order = arxiv.SortOrder.Descending
-        else:
-            sort_by = arxiv.SortCriterion.Relevance
-            sort_order = arxiv.SortOrder.Descending
+        sort_by = self._sort_criterion(input_data.user_request or "")
+        sort_order = arxiv.SortOrder.Descending
 
         # ── 阶段 4：执行搜索 ──
         papers = await self.paper_searcher.search_papers(
             query=arxiv_query,
-            max_results=max_results,
+            max_results=candidate_count,
             sort_by=sort_by,
             sort_order=sort_order,
         )
@@ -184,6 +229,8 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         papers, discarded = await self._filter_relevant_papers(
             papers, input_data.user_request or "", query_keywords
         )
+        filtered_count = len(papers)
+        papers = papers[:target_count]
 
         # ── 阶段 6：转换结果并下载 PDF ──
         results = []
@@ -206,7 +253,9 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
                 "querys": query_keywords,
                 "start_date": start_date,
                 "end_date": end_date,
-                "filtered_kept": len(papers),
+                "candidate_count": candidate_count,
+                "filtered_kept": filtered_count,
+                "returned_count": len(papers),
                 "filtered_discarded": discarded,
             },
         )
@@ -220,7 +269,7 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
             user_request: 用户的原始需求。
             feedback: 前一次生成失败的原因，用于引导 LLM 自我修正。
         """
-        agent = get_search_agent()
+        agent = self._get_search_agent()
         if agent is None:
             return None
         try:
@@ -234,7 +283,10 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
                 """
             )
             if feedback:
-                prompt += f"\n前一次生成的查询无效，原因：{feedback}\n请修正后重新生成，只输出 query 本身。"
+                prompt += (
+                    f"\n前一次生成的查询无效，原因：{feedback}\n"
+                    "请修正后重新生成，只输出 query 本身。"
+                )
             response = await agent.run(task=prompt)
             content = response.messages[-1].content
             if isinstance(content, str):
@@ -280,6 +332,31 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         if not papers or not user_request:
             return papers, []
 
+        filtered_all: List[Dict[str, Any]] = []
+        discarded_all: List[Dict[str, Any]] = []
+        for start in range(0, len(papers), self.filter_batch_size):
+            batch = papers[start : start + self.filter_batch_size]
+            filtered, discarded = await self._filter_relevant_batch(
+                batch, user_request, query_keywords
+            )
+            filtered_all.extend(filtered)
+            for record in discarded:
+                adjusted = {**record, "index": int(record["index"]) + start}
+                discarded_all.append(adjusted)
+
+        self.logger.info(
+            f"[{self.name}] 相关性过滤汇总：{len(papers)} → {len(filtered_all)} 篇"
+        )
+        return filtered_all, discarded_all
+
+    async def _filter_relevant_batch(
+        self,
+        papers: List[Dict[str, Any]],
+        user_request: str,
+        query_keywords: List[str],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """对一批候选论文执行相关性过滤。"""
+
         # 构建紧凑的论文摘要列表，便于 LLM 批量判断
         lines = []
         for i, p in enumerate(papers):
@@ -297,11 +374,13 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
             请判断每篇论文是否**同时涉及**用户需求中的所有核心概念。
             只保留严格相关的论文——宁可漏掉边界论文，也不要混入无关的。
 
-            请只输出一个 JSON 数组，包含严格相关的论文索引，例如 [0, 3]。如果都不相关输出 []。
+            请只输出一个 JSON 数组，包含严格相关的论文索引，
+            例如 [0, 3]。如果都不相关输出 []。
             """)
 
+        model_client = None
         try:
-            model_client = create_search_model_client()
+            model_client = create_model_client()
             filter_agent = AssistantAgent(
                 name="filter_agent",
                 model_client=model_client,
@@ -325,8 +404,10 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
                                 "index": i,
                             }
                             discard_records.append(record)
+                            title = p.get("title", "")
+                            paper_id = p.get("paper_id", "")
                             self.logger.debug(
-                                f"[{self.name}] 过滤丢弃 [{i}]: {p.get('title', '')} ({p.get('paper_id', '')})"
+                                f"[{self.name}] 过滤丢弃 [{i}]: {title} ({paper_id})"
                             )
                     self.logger.info(
                         f"[{self.name}] 相关性过滤：{len(papers)} → {len(filtered)} 篇"
@@ -337,13 +418,17 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         except Exception as e:
             self.logger.warning(f"[{self.name}] 相关性过滤异常，保留全部: {e}")
             return papers, []
+        finally:
+            if model_client is not None:
+                await model_client.close()
 
 
 async def search_node(state: State) -> State:
     """LangGraph 适配函数：搜索节点。
 
     命令行阶段直接打印状态；前端接入时设置
-    config={"search_node": {"frontend_enabled": True}} 即可切换为向 state_queue 推送消息。
+    config={"search_node": {"frontend_enabled": True}}
+    即可切换为向 state_queue 推送消息。
     """
     state_queue = state["state_queue"]
     current_state = state["value"]
@@ -375,7 +460,10 @@ async def search_node(state: State) -> State:
             user_request=current_state.user_request,
         )
 
-        search_output = await node.run(search_input)
+        try:
+            search_output = await node.run(search_input)
+        finally:
+            await node.close()
         current_state.search_output = search_output
 
         if search_output.total_count == 0:

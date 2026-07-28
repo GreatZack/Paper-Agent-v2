@@ -11,7 +11,10 @@ from src.graph.orchestrator import WorkflowOrchestrator
 async def test_full_workflow_with_mocked_search():
     """集成测试：验证 search_node 与 LangGraph 编排器能协同完成完整工作流。"""
     state_queue = asyncio.Queue()
-    orchestrator = WorkflowOrchestrator(state_queue=state_queue)
+    orchestrator = WorkflowOrchestrator(
+        state_queue=state_queue,
+        config={"read_node": {"verify": {"enabled": False}}},
+    )
 
     fake_paper = {
         "paper_id": "1234.56789",
@@ -29,10 +32,30 @@ async def test_full_workflow_with_mocked_search():
     mock_searcher = MagicMock()
     mock_searcher.search_papers = AsyncMock(return_value=[fake_paper])
 
-    with patch("src.nodes.search_node.PaperSearcher", return_value=mock_searcher), \
-         patch("src.nodes.read_node.ReadNode.process", new_callable=AsyncMock) as mock_read, \
-         patch("src.nodes.parse_node.ParseNode.process", new_callable=AsyncMock) as mock_parse, \
-         patch("src.nodes.write_node.WriteNode.process", new_callable=AsyncMock) as mock_write:
+    with (
+        patch("src.nodes.search_node.PaperSearcher", return_value=mock_searcher),
+        patch(
+            "src.nodes.search_node.SearchNode._get_search_agent",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "src.nodes.search_node.SearchNode._generate_search_query",
+            new=AsyncMock(return_value='all:"test"'),
+        ),
+        patch(
+            "src.nodes.search_node.SearchNode._filter_relevant_papers",
+            new=AsyncMock(side_effect=lambda papers, *args: (papers, [])),
+        ),
+        patch(
+            "src.nodes.read_node.ReadNode.process", new_callable=AsyncMock
+        ) as mock_read,
+        patch(
+            "src.nodes.parse_node.ParseNode.process", new_callable=AsyncMock
+        ) as mock_parse,
+        patch(
+            "src.nodes.write_node.WriteNode.process", new_callable=AsyncMock
+        ) as mock_write,
+    ):
         mock_read.return_value = type(
             "ReadOutput",
             (),
@@ -54,7 +77,11 @@ async def test_full_workflow_with_mocked_search():
         mock_write.return_value = type(
             "WriteOutput",
             (),
-            {"generated_text": "Final report.", "status": "completed", "section_map": {}},
+            {
+                "generated_text": "Final report.",
+                "status": "completed",
+                "section_map": {},
+            },
         )()
 
         final_state = await orchestrator.start(
@@ -77,7 +104,17 @@ async def test_workflow_routes_to_error_on_search_failure():
     mock_searcher = MagicMock()
     mock_searcher.search_papers = AsyncMock(side_effect=Exception("arxiv unavailable"))
 
-    with patch("src.nodes.search_node.PaperSearcher", return_value=mock_searcher):
+    with (
+        patch("src.nodes.search_node.PaperSearcher", return_value=mock_searcher),
+        patch(
+            "src.nodes.search_node.SearchNode._get_search_agent",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "src.nodes.search_node.SearchNode._generate_search_query",
+            new=AsyncMock(return_value='all:"test"'),
+        ),
+    ):
         final_state = await orchestrator.start(user_request="test", max_papers=3)
 
     assert final_state.current_step == ExecutionState.FAILED

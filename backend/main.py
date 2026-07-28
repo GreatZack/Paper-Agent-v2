@@ -1,5 +1,8 @@
 """FastAPI entry point with WebSocket endpoint for the paper-agent pipeline."""
+
+import json
 import logging
+import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +16,22 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="Paper-Agent-v2 API")
+
+
+def _positive_int_setting(name: str, default: int) -> int:
+    """Read a positive integer environment setting with a safe fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.getLogger("config").warning(
+            "Ignoring invalid %s=%r; using %d", name, raw, default
+        )
+        return default
+    return value if value > 0 else default
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,7 +60,13 @@ async def pipeline_ws(websocket: WebSocket):
         data = await websocket.receive_json()
         query = data.get("query", "")
         raw = data.get("max_papers")
-        max_papers = int(raw) if raw else int(app_config.get("default_max_papers", 50))
+        configured_default = int(app_config.get("default_max_papers", 5))
+        default_max_papers = _positive_int_setting(
+            "DEFAULT_MAX_PAPERS", configured_default
+        )
+        max_papers_limit = _positive_int_setting("MAX_PAPERS_LIMIT", 10)
+        requested_max_papers = int(raw) if raw else default_max_papers
+        max_papers = max(1, min(requested_max_papers, max_papers_limit))
 
         if not query:
             await websocket.send_json(

@@ -1,4 +1,5 @@
-from typing import Any, Optional
+import re
+from typing import Any
 
 from autogen_core.models import ModelInfo
 from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -8,29 +9,47 @@ from src.utils.log_utils import setup_logger
 
 logger = setup_logger(__name__)
 
+_ENV_PLACEHOLDER = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
+
+
+def _missing_setting(value: Any) -> bool:
+    """Return whether a required model setting is empty or unresolved."""
+    return (
+        not isinstance(value, str)
+        or not value.strip()
+        or bool(_ENV_PLACEHOLDER.fullmatch(value.strip()))
+    )
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """Parse YAML booleans and string values consistently."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
+
 
 class ModelClient:
     """OpenAI 兼容远程模型客户端封装。"""
 
     @staticmethod
     def create_client(
-        provider: str,
         model: str,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        vision: bool = True,
+        api_key: str,
+        base_url: str,
+        vision: bool = False,
         function_calling: bool = True,
         json_output: bool = True,
         structured_output: bool = True,
-        family: str = "Qwen",
+        family: str = "unknown",
     ) -> OpenAIChatCompletionClient:
-        """根据提供商和模型名创建远程 API 模型客户端。
+        """创建统一的 OpenAI 兼容远程模型客户端。
 
         Args:
-            provider: 模型提供商名称，对应 config 中的配置节。
             model: 模型名称，例如 "Qwen/Qwen3-32B"。
-            api_key: 可选，直接传入 API 密钥；未传入时从 config 读取。
-            base_url: 可选，直接传入 API 基础地址；未传入时从 config 读取。
+            api_key: 模型服务 API 密钥。
+            base_url: OpenAI 兼容 API 基础地址。
             vision: 是否支持视觉输入。
             function_calling: 是否支持函数调用。
             json_output: 是否支持 JSON 输出。
@@ -41,16 +60,14 @@ class ModelClient:
             配置完成的 OpenAIChatCompletionClient 实例。
 
         Raises:
-            ValueError: 当 api_key 或 base_url 未配置时抛出。
+            ValueError: 当 model、api_key 或 base_url 未配置时抛出。
         """
-        provider_config = config.get(provider, {}) or {}
-        api_key = api_key or provider_config.get("api_key")
-        base_url = base_url or provider_config.get("base_url")
-
-        if not api_key:
-            raise ValueError(f"未配置 {provider} 的 api_key")
-        if not base_url:
-            raise ValueError(f"未配置 {provider} 的 base_url")
+        if _missing_setting(model):
+            raise ValueError("未配置 model.name")
+        if _missing_setting(api_key):
+            raise ValueError("未配置 model.api_key")
+        if _missing_setting(base_url):
+            raise ValueError("未配置 model.base_url")
 
         model_info = ModelInfo(
             vision=vision,
@@ -68,52 +85,21 @@ class ModelClient:
         )
 
 
-def create_model_client(client_type: str) -> OpenAIChatCompletionClient:
-    """根据 client_type 从配置中创建远程模型客户端。
-
-    Args:
-        client_type: 配置节名称，例如 "search-model"、"reading-model"。
-
-    Returns:
-        配置完成的 OpenAIChatCompletionClient 实例。
-
-    Raises:
-        ValueError: 当配置缺失或参数无效时直接抛出，不做任何兜底处理。
-    """
-    model_config = config.get(client_type, {}) or {}
-    provider = model_config.get("model-provider")
-    model = model_config.get("model")
-
-    default_config = config.get("default-model", {}) or {}
-
-    if not provider or not model:
-        provider = default_config.get("model-provider")
-        model = default_config.get("model")
-        model_config = default_config
-
-    if not provider or not model:
-        raise ValueError(f"未配置 {client_type} 也未配置 default-model 的 model-provider 或 model")
-
-    # api_key / base_url: 优先取节点配置，fallback 到 default-model
-    api_key = model_config.get("api_key") or default_config.get("api_key")
-    base_url = model_config.get("base_url") or default_config.get("base_url")
+def create_model_client() -> OpenAIChatCompletionClient:
+    """从唯一的 ``model`` 配置创建所有节点共用的模型客户端。"""
+    model_config = config.get("model", {}) or {}
+    capabilities = model_config.get("capabilities", {}) or {}
 
     return ModelClient.create_client(
-        provider=provider,
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
+        model=model_config.get("name"),
+        api_key=model_config.get("api_key"),
+        base_url=model_config.get("base_url"),
+        vision=_as_bool(capabilities.get("vision"), False),
+        function_calling=_as_bool(capabilities.get("function_calling"), True),
+        json_output=_as_bool(capabilities.get("json_output"), True),
+        structured_output=_as_bool(capabilities.get("structured_output"), True),
+        family=str(capabilities.get("family", "unknown")),
     )
-
-
-def create_search_model_client() -> OpenAIChatCompletionClient:
-    """创建用于搜索的远程模型客户端。"""
-    return create_model_client("search-model")
-
-
-def create_reading_model_client() -> OpenAIChatCompletionClient:
-    """创建用于论文阅读的远程模型客户端。"""
-    return create_model_client("read_node")
 
 
 # =============================================================================
