@@ -5,7 +5,6 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import fitz
-import pymupdf4llm
 from autogen_core import Image as AutoGenImage
 from autogen_core.models import SystemMessage, UserMessage
 from PIL import Image as PILImage
@@ -200,11 +199,13 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             page_texts:  每页 markdown 文本列表
             page_images: 每页渲染图片列表
         """
-        page_chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
-        page_texts = [chunk["text"] for chunk in page_chunks]
-        full_text = "\n\n".join(page_texts)
-
         if self.use_images:
+            # pymupdf4llm 会加载 ONNX 等较重依赖。仅多模态模式需要其
+            # Markdown 布局分析，避免纯文本部署承担数百 MB 的内存峰值。
+            import pymupdf4llm
+
+            page_chunks = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+            page_texts = [chunk["text"] for chunk in page_chunks]
             page_images = self._render_pdf_pages(pdf_path)
             if len(page_texts) != len(page_images):
                 self.logger.warning(
@@ -215,8 +216,13 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                 page_texts = page_texts[:min_count]
                 page_images = page_images[:min_count]
         else:
+            # Render 小内存实例使用轻量文本提取。逐页处理避免
+            # pymupdf4llm 的版面分析模型在长论文上触发 OOM。
+            with fitz.open(pdf_path) as doc:
+                page_texts = [page.get_text("text", sort=True) for page in doc]
             page_images = []
 
+        full_text = "\n\n".join(page_texts)
         return full_text, page_texts, page_images
 
     # ── Token 估算 ────────────────────────────────────────────

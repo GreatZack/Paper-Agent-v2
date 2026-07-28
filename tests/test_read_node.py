@@ -2,7 +2,9 @@
 
 import asyncio
 import os
+import sys
 
+import fitz
 import pytest
 
 from src.core.state_models import (
@@ -158,15 +160,31 @@ class TestMergeChunkResults:
         assert result.contributions == ["A", "B", "C"]
 
 
-# ── PDF 提取测试（调 pymupdf4llm，不调 LLM）──────────────────
+# ── PDF 提取测试（纯文本模式，不调 LLM）─────────────────────
 
 
 class TestExtractMarkdown:
-    def test_extracts_valid_markdown(self, node, sample_search_result):
+    def test_plain_text_mode_skips_heavy_markdown_parser(
+        self, node, tmp_path, monkeypatch
+    ):
+        pdf_path = tmp_path / "plain-text.pdf"
+        with fitz.open() as doc:
+            page = doc.new_page()
+            page.insert_text((72, 72), "Lightweight PDF extraction")
+            doc.save(pdf_path)
+
+        monkeypatch.setitem(sys.modules, "pymupdf4llm", None)
+        text, pages, images = node._extract_pdf_content(str(pdf_path))
+
+        assert "Lightweight PDF extraction" in text
+        assert len(pages) == 1
+        assert images == []
+
+    def test_extracts_valid_text(self, node, sample_search_result):
         md, pages, images = node._extract_pdf_content(sample_search_result.pdf_path)
         assert len(md) > 500
-        assert "# " in md  # 至少有标题
         assert pages
+        assert any(page.strip() for page in pages)
         assert images == []
 
     def test_missing_pdf_raises(self, node):
