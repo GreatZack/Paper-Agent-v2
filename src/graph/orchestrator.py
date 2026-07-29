@@ -116,6 +116,14 @@ class WorkflowOrchestrator:
                 if not result.passed:
                     any_failed = True
                     if result.retry_count >= max_retries:
+                        failed_fields = [
+                            item.field for item in result.items if not item.verified
+                        ]
+                        err.read_node_error = (
+                            f"论文 {paper_id} 验证失败，已达到最大重试次数 "
+                            f"({result.retry_count}/{max_retries})；"
+                            f"未通过字段：{', '.join(failed_fields) or '未知'}"
+                        )
                         self.logger.error(
                             f"[_route] 论文 {paper_id} 验证超限 "
                             f"(retry_count={result.retry_count}/{max_retries})，路由到 error_node"

@@ -1,8 +1,11 @@
 """read_node 测试：离线单元 + 端到端单篇。"""
 
 import asyncio
+import json
 import os
 import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import fitz
 import pytest
@@ -158,6 +161,145 @@ class TestMergeChunkResults:
         k2 = KeyInformation(paper_id="p1", contributions=["B", "C"])
         result = node._merge_chunk_results([k1, k2])
         assert result.contributions == ["A", "B", "C"]
+
+    def test_merge_preserves_unmentioned_limitations(self, node):
+        chunks = [
+            KeyInformation(paper_id="p1", limitations="未提及"),
+            KeyInformation(paper_id="p1", limitations=""),
+        ]
+
+        result = node._merge_chunk_results(chunks)
+
+        assert result.limitations == "未提及"
+
+    def test_real_limitation_takes_precedence_over_unmentioned(self, node):
+        chunks = [
+            KeyInformation(paper_id="p1", limitations="未提及"),
+            KeyInformation(paper_id="p1", limitations="上下文长度仍有限"),
+        ]
+
+        result = node._merge_chunk_results(chunks)
+
+        assert result.limitations == "上下文长度仍有限"
+
+
+class TestVerification:
+    @pytest.mark.asyncio
+    async def test_optional_empty_field_is_verified_as_unmentioned(self, node):
+        node._model_client = SimpleNamespace(
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "limitations": {
+                                "verified": True,
+                                "exact_quote": "原文未明确列出局限性",
+                                "reason": "",
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        )
+        key_info = KeyInformation(paper_id="p1", limitations="")
+
+        result = await node._verify_one_paper(
+            "论文正文没有局限性章节",
+            key_info,
+            fields_to_verify=["limitations"],
+            optional_fields=["limitations"],
+        )
+
+        assert result is not None
+        assert result.passed is True
+        assert key_info.limitations == "未提及"
+        assert [item.field for item in result.items] == ["limitations"]
+
+    @pytest.mark.asyncio
+    async def test_empty_verification_field_list_skips_model_call(self, node):
+        model_client = SimpleNamespace(create=AsyncMock())
+        node._model_client = model_client
+
+        result = await node._verify_one_paper(
+            "论文正文",
+            KeyInformation(paper_id="p1"),
+            fields_to_verify=["unsupported_field"],
+        )
+
+        assert result is not None
+        assert result.passed is True
+        model_client.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_optional_verification_failure_does_not_block_paper(self, node):
+        node._model_client = SimpleNamespace(
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "key_methodology": {
+                                "verified": True,
+                                "exact_quote": "method evidence",
+                                "reason": "",
+                            },
+                            "limitations": {
+                                "verified": False,
+                                "exact_quote": "",
+                                "reason": "原文没有支持该局限性描述",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        )
+        key_info = KeyInformation(
+            paper_id="p1",
+            key_methodology="可靠的方法描述",
+            limitations="无法证实的局限性",
+        )
+
+        result = await node._verify_one_paper(
+            "论文正文",
+            key_info,
+            fields_to_verify=["key_methodology", "limitations"],
+            optional_fields=["limitations"],
+        )
+
+        assert result is not None
+        assert result.passed is True
+        assert key_info.limitations == "未能从原文可靠验证"
+        assert result.items[1].verified is False
+
+    @pytest.mark.asyncio
+    async def test_required_verification_failure_blocks_paper(self, node):
+        node._model_client = SimpleNamespace(
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "main_results": {
+                                "verified": False,
+                                "exact_quote": "",
+                                "reason": "结果数值与原文不一致",
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        )
+
+        result = await node._verify_one_paper(
+            "论文正文",
+            KeyInformation(paper_id="p1", main_results="错误结果"),
+            fields_to_verify=["main_results"],
+            optional_fields=["limitations"],
+        )
+
+        assert result is not None
+        assert result.passed is False
 
 
 # ── PDF 提取测试（纯文本模式，不调 LLM）─────────────────────

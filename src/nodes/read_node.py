@@ -594,6 +594,9 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
         preferred_sections: Optional[List[str]] = None,
     ) -> str:
         """从 results 中取 field 的第一个有效值；可优先匹配 sections。"""
+        has_unmentioned = any(
+            getattr(result, field, "") == "未提及" for result in results
+        )
         if preferred_sections:
             for section in preferred_sections:
                 for r in results:
@@ -607,36 +610,73 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             val = getattr(r, field, "")
             if val and val != "未提及":
                 return val
-        return ""
+        return "未提及" if has_unmentioned else ""
 
     @staticmethod
     def _concat_non_empty(results: List[KeyInformation], field: str) -> str:
         """拼接所有非空 field 值，用换行分隔。"""
         parts = []
+        has_unmentioned = False
         for r in results:
             val = getattr(r, field, "")
-            if val and val != "未提及":
+            if val == "未提及":
+                has_unmentioned = True
+            elif val:
                 parts.append(val)
-        return "\n".join(parts)
+        if parts:
+            return "\n".join(parts)
+        return "未提及" if has_unmentioned else ""
 
     # ── 验证 ──────────────────────────────────────────────────
 
     async def _verify_one_paper(
-        self, md_text: str, ki: KeyInformation
+        self,
+        md_text: str,
+        ki: KeyInformation,
+        fields_to_verify: Optional[List[str]] = None,
+        optional_fields: Optional[List[str]] = None,
     ) -> Optional[VerifyResult]:
         """用 LLM 验证一篇论文的提取结果是否忠实于原文。"""
         paper_id = ki.paper_id
 
-        claims_to_verify = {
+        supported_claims = {
             "key_methodology": ki.key_methodology,
             "main_results": ki.main_results,
             "limitations": ki.limitations,
         }
+        requested_fields = (
+            list(supported_claims)
+            if fields_to_verify is None
+            else fields_to_verify
+        )
+        requested_fields = [
+            field for field in requested_fields if field in supported_claims
+        ]
+        optional_field_set = set(
+            ["limitations"] if optional_fields is None else optional_fields
+        )
+
+        claims_to_verify = {}
+        for field in requested_fields:
+            claim = supported_claims[field]
+            if field in optional_field_set and not claim.strip():
+                claim = "未提及"
+                setattr(ki, field, claim)
+            claims_to_verify[field] = claim
+
+        if not claims_to_verify:
+            return VerifyResult(
+                paper_id=paper_id,
+                items=[],
+                passed=True,
+                retry_count=0,
+            )
 
         text_part = (
             f"## 论文全文（Markdown）\n\n{md_text}\n\n"
             f"## 提取结果（待验证）\n\n"
-            f"{json.dumps(claims_to_verify, ensure_ascii=False, indent=2)}"
+            f"{json.dumps(claims_to_verify, ensure_ascii=False, indent=2)}\n\n"
+            f"本次只验证以下字段：{', '.join(requested_fields)}"
         )
 
         page_images = self._image_cache.get(paper_id, [])
@@ -658,7 +698,7 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
             parsed = json.loads(content)
 
             items = []
-            for field in ("key_methodology", "main_results", "limitations"):
+            for field in requested_fields:
                 field_result = parsed.get(field, {})
                 items.append(
                     VerificationItem(
@@ -670,17 +710,43 @@ class ReadNode(BaseNode[ReadInput, ReadOutput]):
                     )
                 )
 
+            for item in items:
+                if not item.verified and item.field in optional_field_set:
+                    setattr(ki, item.field, "未能从原文可靠验证")
+
             from datetime import datetime
 
             verify_result = VerifyResult(
                 paper_id=paper_id,
                 items=items,
-                passed=all(item.verified for item in items),
+                passed=all(
+                    item.verified
+                    for item in items
+                    if item.field not in optional_field_set
+                ),
                 retry_count=0,
                 verified_at=datetime.now().isoformat(),
             )
-            verification_status = "通过" if verify_result.passed else "不通过"
+            optional_warnings = [
+                item.field
+                for item in items
+                if not item.verified and item.field in optional_field_set
+            ]
+            if verify_result.passed and optional_warnings:
+                verification_status = (
+                    f"通过（可选字段警告：{', '.join(optional_warnings)}）"
+                )
+            else:
+                verification_status = "通过" if verify_result.passed else "不通过"
             self.logger.info(f"[read_node] {paper_id}: 验证{verification_status}")
+            for item in items:
+                if not item.verified:
+                    self.logger.warning(
+                        "[read_node] %s: 字段 %s 验证失败 — %s",
+                        paper_id,
+                        item.field,
+                        item.reason or "模型未返回具体原因",
+                    )
             return verify_result
 
         except Exception as e:
@@ -745,10 +811,20 @@ async def read_node(state: State) -> State:
 
             # ── 验证 ──
             if verify_enabled:
+                fields_to_verify = verify_cfg.get(
+                    "fields_to_verify",
+                    ["key_methodology", "main_results", "limitations"],
+                )
+                optional_fields = verify_cfg.get("optional_fields", ["limitations"])
                 for ki in read_output.key_info:
                     md_text = node._markdown_cache.get(ki.paper_id, "")
                     if md_text:
-                        verify_result = await node._verify_one_paper(md_text, ki)
+                        verify_result = await node._verify_one_paper(
+                            md_text,
+                            ki,
+                            fields_to_verify=fields_to_verify,
+                            optional_fields=optional_fields,
+                        )
                         if verify_result:
                             prev = existing_results.get(ki.paper_id)
                             if prev:

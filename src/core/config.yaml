@@ -53,6 +53,8 @@ read_node:
       - key_methodology
       - main_results
       - limitations
+    optional_fields:                  # 原文未提及时允许标记为“未提及”
+      - limitations
 
 # 全局默认配置
 default_max_papers: 1
