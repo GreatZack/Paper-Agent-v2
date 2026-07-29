@@ -15,6 +15,9 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 
+# AutoGen 的事件日志会输出完整论文、提示词和模型推理，线上只保留警告。
+logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
+
 app = FastAPI(title="Paper-Agent-v2 API")
 
 

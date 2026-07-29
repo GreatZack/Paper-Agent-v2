@@ -1,8 +1,13 @@
 """read_node 测试：离线单元 + 端到端单篇。"""
 
 import asyncio
+import json
 import os
+import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import fitz
 import pytest
 
 from src.core.state_models import (
@@ -16,10 +21,17 @@ from src.nodes.read_node import ReadNode
 
 # ── fixture ────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def node():
     """默认配置的 ReadNode。"""
-    return ReadNode({"concurrency": 2, "max_tokens_threshold": 90000})
+    return ReadNode(
+        {
+            "concurrency": 2,
+            "max_tokens_threshold": 90000,
+            "use_images": False,
+        }
+    )
 
 
 @pytest.fixture
@@ -43,6 +55,7 @@ def sample_search_result():
 
 
 # ── 离线单元测试（不调 API）────────────────────────────────────
+
 
 class TestTokenEstimation:
     def test_english_text(self, node):
@@ -71,6 +84,26 @@ class TestSplitBySection:
         assert len(chunks) == 1
         assert "Plain text" in chunks[0]
 
+    def test_model_chunks_stay_within_threshold(self):
+        node = ReadNode({"max_tokens_threshold": 10})
+        md = "# Title\n\n## A\n" + "a" * 60 + "\n\n## B\n" + "b" * 60
+
+        chunks = node._chunk_text_for_model(md)
+
+        assert len(chunks) > 1
+        assert all(node._estimate_tokens(chunk) <= 10 for chunk in chunks)
+
+
+class TestAuthorFormatting:
+    def test_truncates_very_long_author_list(self, node):
+        authors = [f"Author {i}" for i in range(25)]
+
+        result = node._format_authors(authors)
+
+        assert "Author 19" in result
+        assert "Author 20" not in result
+        assert "另有 5 位作者" in result
+
 
 class TestStripJsonFence:
     def test_with_fence(self, node):
@@ -89,7 +122,8 @@ class TestStripJsonFence:
 class TestMergeChunkResults:
     def test_single_chunk(self, node):
         k = KeyInformation(
-            paper_id="p1", core_problem="test",
+            paper_id="p1",
+            core_problem="test",
             evidence_sections={"core_problem": "§1"},
         )
         result = node._merge_chunk_results([k])
@@ -97,11 +131,13 @@ class TestMergeChunkResults:
 
     def test_merge_prefers_abstract_for_core_problem(self, node):
         k1 = KeyInformation(
-            paper_id="p1", core_problem="",
+            paper_id="p1",
+            core_problem="",
             evidence_sections={"core_problem": "Introduction §1"},
         )
         k2 = KeyInformation(
-            paper_id="p1", core_problem="real problem",
+            paper_id="p1",
+            core_problem="real problem",
             evidence_sections={"core_problem": "Abstract"},
         )
         result = node._merge_chunk_results([k1, k2])
@@ -109,10 +145,12 @@ class TestMergeChunkResults:
 
     def test_merge_concat_results(self, node):
         k1 = KeyInformation(
-            paper_id="p1", main_results="result A",
+            paper_id="p1",
+            main_results="result A",
         )
         k2 = KeyInformation(
-            paper_id="p1", main_results="result B",
+            paper_id="p1",
+            main_results="result B",
         )
         result = node._merge_chunk_results([k1, k2])
         assert "result A" in result.main_results
@@ -124,27 +162,186 @@ class TestMergeChunkResults:
         result = node._merge_chunk_results([k1, k2])
         assert result.contributions == ["A", "B", "C"]
 
+    def test_merge_preserves_unmentioned_limitations(self, node):
+        chunks = [
+            KeyInformation(paper_id="p1", limitations="未提及"),
+            KeyInformation(paper_id="p1", limitations=""),
+        ]
 
-# ── PDF 提取测试（调 pymupdf4llm，不调 LLM）──────────────────
+        result = node._merge_chunk_results(chunks)
+
+        assert result.limitations == "未提及"
+
+    def test_real_limitation_takes_precedence_over_unmentioned(self, node):
+        chunks = [
+            KeyInformation(paper_id="p1", limitations="未提及"),
+            KeyInformation(paper_id="p1", limitations="上下文长度仍有限"),
+        ]
+
+        result = node._merge_chunk_results(chunks)
+
+        assert result.limitations == "上下文长度仍有限"
+
+
+class TestVerification:
+    @pytest.mark.asyncio
+    async def test_optional_empty_field_is_verified_as_unmentioned(self, node):
+        node._model_client = SimpleNamespace(
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "limitations": {
+                                "verified": True,
+                                "exact_quote": "原文未明确列出局限性",
+                                "reason": "",
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        )
+        key_info = KeyInformation(paper_id="p1", limitations="")
+
+        result = await node._verify_one_paper(
+            "论文正文没有局限性章节",
+            key_info,
+            fields_to_verify=["limitations"],
+            optional_fields=["limitations"],
+        )
+
+        assert result is not None
+        assert result.passed is True
+        assert key_info.limitations == "未提及"
+        assert [item.field for item in result.items] == ["limitations"]
+
+    @pytest.mark.asyncio
+    async def test_empty_verification_field_list_skips_model_call(self, node):
+        model_client = SimpleNamespace(create=AsyncMock())
+        node._model_client = model_client
+
+        result = await node._verify_one_paper(
+            "论文正文",
+            KeyInformation(paper_id="p1"),
+            fields_to_verify=["unsupported_field"],
+        )
+
+        assert result is not None
+        assert result.passed is True
+        model_client.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_optional_verification_failure_does_not_block_paper(self, node):
+        node._model_client = SimpleNamespace(
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "key_methodology": {
+                                "verified": True,
+                                "exact_quote": "method evidence",
+                                "reason": "",
+                            },
+                            "limitations": {
+                                "verified": False,
+                                "exact_quote": "",
+                                "reason": "原文没有支持该局限性描述",
+                            },
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        )
+        key_info = KeyInformation(
+            paper_id="p1",
+            key_methodology="可靠的方法描述",
+            limitations="无法证实的局限性",
+        )
+
+        result = await node._verify_one_paper(
+            "论文正文",
+            key_info,
+            fields_to_verify=["key_methodology", "limitations"],
+            optional_fields=["limitations"],
+        )
+
+        assert result is not None
+        assert result.passed is True
+        assert key_info.limitations == "未能从原文可靠验证"
+        assert result.items[1].verified is False
+
+    @pytest.mark.asyncio
+    async def test_required_verification_failure_blocks_paper(self, node):
+        node._model_client = SimpleNamespace(
+            create=AsyncMock(
+                return_value=SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "main_results": {
+                                "verified": False,
+                                "exact_quote": "",
+                                "reason": "结果数值与原文不一致",
+                            }
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        )
+
+        result = await node._verify_one_paper(
+            "论文正文",
+            KeyInformation(paper_id="p1", main_results="错误结果"),
+            fields_to_verify=["main_results"],
+            optional_fields=["limitations"],
+        )
+
+        assert result is not None
+        assert result.passed is False
+
+
+# ── PDF 提取测试（纯文本模式，不调 LLM）─────────────────────
+
 
 class TestExtractMarkdown:
-    def test_extracts_valid_markdown(self, node, sample_search_result):
-        md = node._extract_markdown(sample_search_result.pdf_path)
+    def test_plain_text_mode_skips_heavy_markdown_parser(
+        self, node, tmp_path, monkeypatch
+    ):
+        pdf_path = tmp_path / "plain-text.pdf"
+        with fitz.open() as doc:
+            page = doc.new_page()
+            page.insert_text((72, 72), "Lightweight PDF extraction")
+            doc.save(pdf_path)
+
+        monkeypatch.setitem(sys.modules, "pymupdf4llm", None)
+        text, pages, images = node._extract_pdf_content(str(pdf_path))
+
+        assert "Lightweight PDF extraction" in text
+        assert len(pages) == 1
+        assert images == []
+
+    def test_extracts_valid_text(self, node, sample_search_result):
+        md, pages, images = node._extract_pdf_content(sample_search_result.pdf_path)
         assert len(md) > 500
-        assert "# " in md  # 至少有标题
+        assert pages
+        assert any(page.strip() for page in pages)
+        assert images == []
 
     def test_missing_pdf_raises(self, node):
         with pytest.raises(Exception):
-            node._extract_markdown("data/papers/nonexistent.pdf")
+            node._extract_pdf_content("data/papers/nonexistent.pdf")
 
 
 # ── 空文档处理 ─────────────────────────────────────────────────
 
+
 class TestEmptyDocuments:
     def test_empty_documents_returns_empty_output(self, node):
-        result = asyncio.run(node.process(
-            ReadInput(documents=[], reading_strategy=ReadingStrategy())
-        ))
+        result = asyncio.run(
+            node.process(ReadInput(documents=[], reading_strategy=ReadingStrategy()))
+        )
         assert isinstance(result, ReadOutput)
         assert result.key_info == []
         assert result.status == "completed"
@@ -152,19 +349,25 @@ class TestEmptyDocuments:
 
 # ── 失败路径（无 pdf_path）────────────────────────────────────
 
+
 class TestFailedPapers:
     def test_no_pdf_path_goes_to_failed(self, node):
         paper = SearchResult(
-            paper_id="no_pdf", title="No PDF", pdf_path=None,
+            paper_id="no_pdf",
+            title="No PDF",
+            pdf_path=None,
         )
-        result = asyncio.run(node.process(
-            ReadInput(documents=[paper], reading_strategy=ReadingStrategy())
-        ))
+        result = asyncio.run(
+            node.process(
+                ReadInput(documents=[paper], reading_strategy=ReadingStrategy())
+            )
+        )
         assert "no_pdf" in result.failed_paper_ids
         assert len(result.key_info) == 0
 
 
 # ── 端到端单篇测试（真调 Mimo API）─────────────────────────
+
 
 @pytest.mark.slow
 class TestEndToEnd:

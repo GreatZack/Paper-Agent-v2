@@ -27,7 +27,7 @@ search_node:
 
 read_node:
   concurrency: 2
-  max_tokens_threshold: 90000
+  max_tokens_threshold: 25000
   use_images: false
   image:
     detail: low
@@ -39,6 +39,8 @@ read_node:
     fields_to_verify:
       - key_methodology
       - main_results
+      - limitations
+    optional_fields:
       - limitations
 
 default_max_papers: 1

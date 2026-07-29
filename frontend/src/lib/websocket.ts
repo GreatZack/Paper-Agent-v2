@@ -22,9 +22,8 @@ export class PipelineSocket {
   private ws: WebSocket | null = null;
   private url: string;
   private callbacks: PipelineCallbacks;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 3;
-  private reconnectDelay = 1000;
+  private intentionalClose = false;
+  private failureNotified = false;
 
   constructor(url: string, callbacks: PipelineCallbacks) {
     this.url = url;
@@ -32,11 +31,12 @@ export class PipelineSocket {
   }
 
   connect(query: string, maxPapers?: number) {
+    this.intentionalClose = false;
+    this.failureNotified = false;
     this.callbacks.onStatusChange("connecting");
     this.ws = new WebSocket(this.url);
 
     this.ws.onopen = () => {
-      this.reconnectAttempts = 0;
       this.callbacks.onStatusChange("running");
       const payload: Record<string, unknown> = { action: "start", query };
       if (maxPapers !== undefined) payload.max_papers = maxPapers;
@@ -63,19 +63,28 @@ export class PipelineSocket {
       }
     };
 
-    this.ws.onerror = () => {
-      this.callbacks.onError("WebSocket connection error");
-    };
+    this.ws.onerror = () => this.notifyFailure("WebSocket connection error");
 
     this.ws.onclose = () => {
-      if (this.callbacks.onStatusChange) {
-        this.callbacks.onStatusChange("idle");
+      this.ws = null;
+      if (!this.intentionalClose) {
+        this.notifyFailure(
+          "与服务器的连接已中断，请稍后重试。长任务运行期间请保持页面打开。",
+        );
       }
     };
   }
 
+  private notifyFailure(message: string) {
+    if (this.failureNotified || this.intentionalClose) return;
+    this.failureNotified = true;
+    this.callbacks.onStatusChange("failed");
+    this.callbacks.onError(message);
+  }
+
   close() {
     if (this.ws) {
+      this.intentionalClose = true;
       this.ws.onclose = null;
       this.ws.close();
       this.ws = null;

@@ -36,6 +36,12 @@ export function usePipeline(): PipelineState {
 
       const socket = new PipelineSocket(WS_URL, {
         onProgress: (step, state, data) => {
+          if (step === "heartbeat") {
+            setProgressMessage(
+              typeof data === "string" ? data : "任务仍在处理中",
+            );
+            return;
+          }
           setCurrentStep(step);
           setProgressMessage(typeof data === "string" ? data : `${step}...`);
         },

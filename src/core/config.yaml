@@ -38,7 +38,7 @@ read_node:
   # 并发处理论文数
   concurrency: 2
   # 超过此 token 数触发 section 切块
-  max_tokens_threshold: 90000
+  max_tokens_threshold: 25000
   # Render 免费实例使用纯文本模式，保留图片参数以便未来重新启用
   use_images: false
   image:
@@ -52,6 +52,8 @@ read_node:
     fields_to_verify:                 # 需验证的字段列表
       - key_methodology
       - main_results
+      - limitations
+    optional_fields:                  # 原文未提及时允许标记为“未提及”
       - limitations
 
 # 全局默认配置
