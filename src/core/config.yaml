@@ -35,20 +35,14 @@ search_node:
 
 # 阅读节点配置
 read_node:
-  # 并发处理论文数
-  concurrency: 2
+  # 并发处理论文数（PyMuPDF 持 GIL，to_thread 并行负收益，0.1 CPU 下设为 1）
+  concurrency: 1
   # 超过此 token 数触发 section 切块
   max_tokens_threshold: 25000
-  # Render 免费实例使用纯文本模式，保留图片参数以便未来重新启用
-  use_images: false
-  image:
-    detail: low
-    dpi: 150
-    max_size: 1024
   # 证据验证配置
   verify:
     enabled: true                     # 是否启用验证
-    max_retries_per_paper: 3          # 单篇最大验证重试次数
+    max_retries_per_paper: 1          # 单篇最大验证重试次数（收紧防 15min 顶破）
     fields_to_verify:                 # 需验证的字段列表
       - key_methodology
       - main_results
@@ -56,5 +50,5 @@ read_node:
     optional_fields:                  # 原文未提及时允许标记为“未提及”
       - limitations
 
-# 全局默认配置
-default_max_papers: 1
+# 全局默认配置（前端不传篇数，实际生效值 = min(default, MAX_PAPERS_LIMIT)）
+default_max_papers: 10

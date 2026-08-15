@@ -3,10 +3,10 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-from autogen_core.models import SystemMessage, UserMessage
 from pydantic import ValidationError
 
 from src.core.model_client import create_model_client
+from src.core.openai_client import SystemMessage, UserMessage
 from src.core.prompts import parse_comparison_prompt, parse_taxonomy_prompt
 from src.core.state_models import (
     BackToFrontData,

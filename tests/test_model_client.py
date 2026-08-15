@@ -1,13 +1,13 @@
 from unittest.mock import patch
 
 import pytest
-from autogen_ext.models.openai import OpenAIChatCompletionClient
 
 from src.core.model_client import (
     ModelClient,
     create_local_model_client,
     create_model_client,
 )
+from src.core.openai_client import OpenAICompatClient
 
 
 @pytest.fixture
@@ -36,8 +36,8 @@ def test_model_client_create_client_with_valid_config(valid_model_config):
             base_url="https://api.test.com/v1",
         )
 
-    assert isinstance(client, OpenAIChatCompletionClient)
-    assert client.model_info is not None
+    assert isinstance(client, OpenAICompatClient)
+    assert client._model == "Qwen/Qwen3-32B"
 
 
 def test_model_client_create_client_missing_api_key(valid_model_config):
@@ -62,8 +62,8 @@ def test_create_model_client_with_valid_config(valid_model_config):
     with patch("src.core.model_client.config", valid_model_config):
         client = create_model_client()
 
-    assert isinstance(client, OpenAIChatCompletionClient)
-    assert client.model_info["vision"] is False
+    assert isinstance(client, OpenAICompatClient)
+    assert client._base_url == "https://api.test.com/v1"
 
 
 def test_create_model_client_missing_name(valid_model_config):

@@ -1,10 +1,9 @@
 import re
+from functools import lru_cache
 from typing import Any
 
-from autogen_core.models import ModelInfo
-from autogen_ext.models.openai import OpenAIChatCompletionClient
-
 from src.core.config import config
+from src.core.openai_client import OpenAICompatClient
 from src.utils.log_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -31,7 +30,7 @@ def _as_bool(value: Any, default: bool) -> bool:
 
 
 class ModelClient:
-    """OpenAI 兼容远程模型客户端封装。"""
+    """OpenAI 兼容远程模型客户端封装（原生 openai SDK 薄壳）。"""
 
     @staticmethod
     def create_client(
@@ -43,7 +42,7 @@ class ModelClient:
         json_output: bool = True,
         structured_output: bool = True,
         family: str = "unknown",
-    ) -> OpenAIChatCompletionClient:
+    ) -> OpenAICompatClient:
         """创建统一的 OpenAI 兼容远程模型客户端。
 
         Args:
@@ -57,7 +56,7 @@ class ModelClient:
             family: 模型家族名称。
 
         Returns:
-            配置完成的 OpenAIChatCompletionClient 实例。
+            配置完成的 OpenAICompatClient 实例。
 
         Raises:
             ValueError: 当 model、api_key 或 base_url 未配置时抛出。
@@ -69,63 +68,37 @@ class ModelClient:
         if _missing_setting(base_url):
             raise ValueError("未配置 model.base_url")
 
-        model_info = ModelInfo(
-            vision=vision,
-            function_calling=function_calling,
-            json_output=json_output,
-            family=family,
-            structured_output=structured_output,
-        )
-
-        return OpenAIChatCompletionClient(
+        return OpenAICompatClient(
             model=model,
             api_key=api_key,
             base_url=base_url,
-            model_info=model_info,
         )
 
 
-def create_model_client() -> OpenAIChatCompletionClient:
-    """从唯一的 ``model`` 配置创建所有节点共用的模型客户端。"""
-    model_config = config.get("model", {}) or {}
-    capabilities = model_config.get("capabilities", {}) or {}
+@lru_cache(maxsize=1)
+def create_model_client() -> OpenAICompatClient:
+    """从唯一的 ``model`` 配置创建所有节点共用的模型客户端。
 
+    使用 lru_cache(1) 复用同一个无状态客户端实例，避免每请求新建
+    多个 httpx 连接池（0.1 CPU/512MB 下是主要的内存浪费源）。
+    """
+    model_config = config.get("model", {}) or {}
     return ModelClient.create_client(
         model=model_config.get("name"),
         api_key=model_config.get("api_key"),
         base_url=model_config.get("base_url"),
-        vision=_as_bool(capabilities.get("vision"), False),
-        function_calling=_as_bool(capabilities.get("function_calling"), True),
-        json_output=_as_bool(capabilities.get("json_output"), True),
-        structured_output=_as_bool(capabilities.get("structured_output"), True),
-        family=str(capabilities.get("family", "unknown")),
+        vision=_as_bool((model_config.get("capabilities") or {}).get("vision"), False),
+        function_calling=_as_bool(
+            (model_config.get("capabilities") or {}).get("function_calling"), True
+        ),
+        json_output=_as_bool(
+            (model_config.get("capabilities") or {}).get("json_output"), True
+        ),
+        structured_output=_as_bool(
+            (model_config.get("capabilities") or {}).get("structured_output"), True
+        ),
+        family=str((model_config.get("capabilities") or {}).get("family", "unknown")),
     )
-
-
-# =============================================================================
-# 本地模型调用预留接口
-# =============================================================================
-# 下面的代码段与本地模型调用相关，目前默认使用远程 API，因此相关实现暂不启用。
-# 当需要接入 vLLM、Ollama、Transformers 等本地推理方案时，可在此扩展实现。
-
-# def create_local_model_client(
-#     model_path: str,
-#     device: str = "auto",
-#     load_in_8bit: bool = False,
-#     **kwargs: Any,
-# ) -> OpenAIChatCompletionClient:
-#     """创建本地模型客户端。
-#
-#     Args:
-#         model_path: 本地模型路径或 HuggingFace 模型 ID。
-#         device: 运行设备，例如 "auto"、"cpu"、"cuda:0"。
-#         load_in_8bit: 是否使用 8bit 量化加载。
-#         **kwargs: 额外推理参数，例如 temperature、max_tokens。
-#
-#     Returns:
-#         与远程模型接口一致的 OpenAIChatCompletionClient 实例。
-#     """
-#     raise NotImplementedError("本地模型调用功能尚未实现")
 
 
 def create_local_model_client(
@@ -133,7 +106,7 @@ def create_local_model_client(
     device: str = "auto",
     load_in_8bit: bool = False,
     **kwargs: Any,
-) -> OpenAIChatCompletionClient:
+) -> OpenAICompatClient:
     """本地模型客户端标准化接口（预留实现）。
 
     该接口目前仅作为预留，未来可接入 vLLM、Ollama、Transformers 等本地推理方案。
@@ -141,12 +114,12 @@ def create_local_model_client(
 
     Args:
         model_path: 本地模型路径或 HuggingFace 模型 ID。
-        device: 运行设备，例如 "auto"、"cpu"、"cuda:0"。
+        device: 运行设备，例如 "auto"、"cuda:0"。
         load_in_8bit: 是否使用 8bit 量化加载。
         **kwargs: 额外推理参数，例如 temperature、max_tokens。
 
     Returns:
-        与远程模型接口一致的 OpenAIChatCompletionClient 实例。
+        与远程模型接口一致的 OpenAICompatClient 实例。
 
     Raises:
         NotImplementedError: 当前尚未实现本地模型调用，请使用远程 API 模型。

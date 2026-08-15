@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import resource
+import threading
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,10 +17,11 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 
-# AutoGen 的事件日志会输出完整论文、提示词和模型推理，线上只保留警告。
-logging.getLogger("autogen_core.events").setLevel(logging.WARNING)
-
 app = FastAPI(title="Paper-Agent-v2 API")
+
+# 简单的并发计数器（进程内，未线程隔离，仅用于运维观测）
+_active_pipelines = 0
+_counter_lock = threading.Lock()
 
 
 def _positive_int_setting(name: str, default: int) -> int:
@@ -54,8 +57,22 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics():
+    """轻量运维观测：并发流水线数与进程 RSS。"""
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    with _counter_lock:
+        active = _active_pipelines
+    return {
+        "active_pipelines": active,
+        "rss_mb": round(rss_mb, 1),
+        "default_max_papers": int(app_config.get("default_max_papers", 10)),
+    }
+
+
 @app.websocket("/ws/pipeline")
 async def pipeline_ws(websocket: WebSocket):
+    global _active_pipelines
     await websocket.accept()
     logger = logging.getLogger("ws")
 
@@ -82,7 +99,13 @@ async def pipeline_ws(websocket: WebSocket):
             return
 
         logger.info("Starting pipeline: query=%s max_papers=%d", query, max_papers)
-        await run_pipeline(query, max_papers, websocket)
+        with _counter_lock:
+            _active_pipelines += 1
+        try:
+            await run_pipeline(query, max_papers, websocket)
+        finally:
+            with _counter_lock:
+                _active_pipelines -= 1
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")

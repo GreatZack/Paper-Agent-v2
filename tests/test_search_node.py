@@ -326,7 +326,7 @@ async def test_filter_relevant_papers_returns_discarded():
     mock_agent = MagicMock()
     mock_agent.run = AsyncMock(return_value=mock_response)
 
-    with patch("src.nodes.search_node.AssistantAgent", return_value=mock_agent):
+    with patch("src.nodes.search_node._LiteAgent", return_value=mock_agent):
         with patch("src.nodes.search_node.create_model_client") as mock_client:
             mock_client.return_value = MagicMock(close=AsyncMock())
             kept, discarded = await node._filter_relevant_papers(
@@ -357,7 +357,7 @@ async def test_filter_relevant_papers_discarded_empty_when_parse_fails():
     mock_agent = MagicMock()
     mock_agent.run = AsyncMock(return_value=mock_response)
 
-    with patch("src.nodes.search_node.AssistantAgent", return_value=mock_agent):
+    with patch("src.nodes.search_node._LiteAgent", return_value=mock_agent):
         with patch("src.nodes.search_node.create_model_client") as mock_client:
             mock_client.return_value = MagicMock(close=AsyncMock())
             kept, discarded = await node._filter_relevant_papers(
@@ -443,7 +443,7 @@ def test_search_agents_are_isolated_per_node():
 
     with (
         patch("src.nodes.search_node.create_model_client", side_effect=clients),
-        patch("src.nodes.search_node.AssistantAgent", side_effect=agents),
+        patch("src.nodes.search_node._LiteAgent", side_effect=agents),
     ):
         first = SearchNode()._get_search_agent()
         second = SearchNode()._get_search_agent()

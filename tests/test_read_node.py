@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -29,7 +28,6 @@ def node():
         {
             "concurrency": 2,
             "max_tokens_threshold": 90000,
-            "use_images": False,
         }
     )
 
@@ -306,28 +304,23 @@ class TestVerification:
 
 
 class TestExtractMarkdown:
-    def test_plain_text_mode_skips_heavy_markdown_parser(
-        self, node, tmp_path, monkeypatch
-    ):
+    def test_plain_text_mode_extracts_text(self, node, tmp_path):
         pdf_path = tmp_path / "plain-text.pdf"
         with fitz.open() as doc:
             page = doc.new_page()
             page.insert_text((72, 72), "Lightweight PDF extraction")
             doc.save(pdf_path)
 
-        monkeypatch.setitem(sys.modules, "pymupdf4llm", None)
-        text, pages, images = node._extract_pdf_content(str(pdf_path))
+        text, pages = node._extract_pdf_content(str(pdf_path))
 
         assert "Lightweight PDF extraction" in text
         assert len(pages) == 1
-        assert images == []
 
     def test_extracts_valid_text(self, node, sample_search_result):
-        md, pages, images = node._extract_pdf_content(sample_search_result.pdf_path)
+        md, pages = node._extract_pdf_content(sample_search_result.pdf_path)
         assert len(md) > 500
         assert pages
         assert any(page.strip() for page in pages)
-        assert images == []
 
     def test_missing_pdf_raises(self, node):
         with pytest.raises(Exception):

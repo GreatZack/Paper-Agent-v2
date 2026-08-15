@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import resource
 from typing import Any
 
 from src.core.config import config as app_config
@@ -10,6 +11,12 @@ from src.graph.orchestrator import WorkflowOrchestrator
 
 logger = logging.getLogger("pipeline_handler")
 HEARTBEAT_INTERVAL_SECONDS = 20.0
+MEMORY_LIMIT_MB = 400  # 512MB 实例的预警水位，超过则提前中止防 OOM
+
+
+def _rss_mb() -> float:
+    """当前进程 RSS (MB)。ru_maxrss 是单调高水位，此处仅用其下限近似。"""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
 
 
 async def _send_json(websocket, payload: dict[str, Any]) -> bool:
@@ -46,6 +53,27 @@ async def run_pipeline(query: str, max_papers: int, websocket) -> None:
     if read_config:
         orchestrator_config["read_node"] = read_config
     orchestrator_config["default_max_papers"] = app_config.get("default_max_papers", 5)
+
+    memory_at_start = _rss_mb()
+    logger.info(
+        "Starting pipeline: query=%s max_papers=%d rss=%.0fMB",
+        query,
+        max_papers,
+        memory_at_start,
+    )
+    if memory_at_start > MEMORY_LIMIT_MB:
+        await _send_json(
+            websocket,
+            {
+                "step": "failed",
+                "state": "error",
+                "data": (
+                    f"服务内存即将耗尽 ({memory_at_start:.0f}MB)，"
+                    "请稍后再试或减少同时进行的任务。"
+                ),
+            },
+        )
+        return
 
     orchestrator = WorkflowOrchestrator(
         state_queue=queue,
@@ -109,6 +137,10 @@ async def run_pipeline(query: str, max_papers: int, websocket) -> None:
                 next_heartbeat = loop.time() + HEARTBEAT_INTERVAL_SECONDS
 
         if not client_connected:
+            # 客户端已断开：立即取消后台任务，避免资源残留
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             return
 
         # A terminal queue message can arrive just before the task returns.

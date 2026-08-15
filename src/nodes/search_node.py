@@ -2,12 +2,13 @@ import json
 import re
 import textwrap
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import arxiv
-from autogen_agentchat.agents import AssistantAgent
 
 from src.core.model_client import create_model_client
+from src.core.openai_client import SystemMessage, UserMessage
 from src.core.prompts import search_agent_prompt
 from src.core.state_models import (
     BackToFrontData,
@@ -35,6 +36,28 @@ _ALLOWED_FIELD_PREFIXES = {
 }
 
 
+class _LiteAgent:
+    """极简 Agent 适配：单轮 prompt -> 文本。
+
+    替代 autogen 的 AssistantAgent（去重后的轻量实现）。
+    run(task) 返回兼容 ``response.messages[-1].content`` 访问形式的结果。
+    """
+
+    def __init__(self, model_client, system_message: str):
+        self._client = model_client
+        self._system_message = system_message
+
+    async def run(self, task: str):
+        messages = [
+            SystemMessage(content=self._system_message),
+            UserMessage(content=task, source="user"),
+        ]
+        result = await self._client.create(messages=messages)
+        return SimpleNamespace(
+            messages=[SimpleNamespace(content=result.content)]
+        )
+
+
 class SearchNode(BaseNode[SearchInput, SearchOutput]):
     """搜索节点：根据查询条件检索相关文档。"""
 
@@ -57,17 +80,16 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         )
         self.filter_batch_size = max(1, int(self.config.get("filter_batch_size", 20)))
         self.paper_searcher = PaperSearcher()
-        self._search_agent: Optional[AssistantAgent] = None
+        self._search_agent: Optional[_LiteAgent] = None
         self._search_model_client = None
 
-    def _get_search_agent(self) -> Optional[AssistantAgent]:
+    def _get_search_agent(self) -> Optional[_LiteAgent]:
         """为当前 SearchNode 请求懒加载独立的查询 Agent。"""
         if self._search_agent is not None:
             return self._search_agent
         try:
             self._search_model_client = create_model_client()
-            self._search_agent = AssistantAgent(
-                name="search_agent",
+            self._search_agent = _LiteAgent(
                 model_client=self._search_model_client,
                 system_message=search_agent_prompt,
             )
@@ -381,8 +403,7 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         model_client = None
         try:
             model_client = create_model_client()
-            filter_agent = AssistantAgent(
-                name="filter_agent",
+            filter_agent = _LiteAgent(
                 model_client=model_client,
                 system_message="你是一个论文相关性判断助手。你的任务是根据用户需求判断论文是否严格相关。",
             )

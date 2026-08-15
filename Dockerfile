@@ -13,11 +13,10 @@ RUN pip install --no-cache-dir \
     "langgraph>=0.6.7" \
     "tenacity>=9.1.2" \
     "arxiv>=2.2.0" \
-    "autogen-agentchat>=0.7.4" \
-    "autogen-ext[openai]>=0.7.4" \
+    "openai>=1.30.0" \
     "python-dotenv>=1.1.1" \
     "pyyaml>=6.0.2" \
-    "pymupdf4llm>=0.1.0" \
+    "pymupdf==1.28.0" \
     "fastapi>=0.115.0" \
     "uvicorn[standard]>=0.30.0" \
     "httpx"

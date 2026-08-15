@@ -3,9 +3,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from autogen_core.models import SystemMessage, UserMessage
-
 from src.core.model_client import create_model_client
+from src.core.openai_client import SystemMessage, UserMessage
 from src.core.prompts import (
     write_batch_summary_prompt,
     write_consolidation_prompt,

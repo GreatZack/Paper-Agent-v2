@@ -13,8 +13,8 @@ services:
       - key: MODEL_BASE_URL
         sync: false
       - key: DEFAULT_MAX_PAPERS
-        value: "1"
+        value: "10"
       - key: MAX_PAPERS_LIMIT
-        value: "5"
+        value: "10"
       - key: PYTHONUNBUFFERED
         value: "1"
