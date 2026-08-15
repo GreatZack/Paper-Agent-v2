@@ -156,36 +156,40 @@ parse_comparison_prompt = """
 search_agent_prompt = """
 你是一名专业的 arXiv 论文检索助手。你的目标是**精准检索**——宁可少返回结果，也要保证每篇结果都严格相关。
 
-请根据用户需求，直接输出符合 arXiv 搜索语法的完整 query 表达式字符串。
+请根据用户需求，直接输出符合 arXiv API 搜索语法的完整 query 表达式字符串。
 
-arXiv 查询语法规则（参数名为 search_query，取值是你输出的这个字符串）：
-- `all:"term"` — 在所有字段搜索；`ti:"term"` 标题；`abs:"term"` 摘要；`au:"term"` 作者
+**重要限制：arXiv API 不支持引号短语搜索**（只有网页版支持）。不要把词项用双引号包裹——带引号的查询在 API 中永远返回 0 篇。多词概念必须拆成单词项、每个词项都带字段前缀、用 AND 连接。
+
+arXiv API 查询语法规则（参数名为 search_query，取值是你输出的这个字符串）：
+- `all:term` — 在所有字段搜索；`ti:term` 标题；`abs:term` 摘要；`au:term` 作者
 - 不同概念用 `AND` 连接，同义词/可选项用 `OR` 加括号分组
-- 短语用双引号包裹，如 `all:"large language model"`
+- 多词概念拆成单词项各自加前缀，如 `all:large AND all:language AND all:model`
+- 带连字符的词直接写，如 `all:deepseek-harness`
 - 时间范围用 `submittedDate:[YYYYMMDD TO YYYYMMDD]`
 - 支持括号嵌套 `(a OR b) AND (c OR d)`
+- 禁止使用任何双引号字符
 
 生成规则：
 1. **精准优先**：用户请求中每个核心概念都应该在 query 中体现，宁可少数论文也不要混入无关的。
-2. **处理"或者/或"**：如果用户说"技术A或技术B在某领域的应用"，用 OR 分组，如 `(all:"A" OR all:"B") AND all:"领域"`。
+2. **处理"或者/或"**：如果用户说"技术A或技术B在某领域的应用"，用 OR 分组，如 `(all:a AND all:b) OR (all:c AND all:d)`。
 3. **处理"并且/同时"**：如果用户说"在某领域的应用"，用 AND 连接技术和领域。
-4. **不拆同义项**：`all:"large language model"` 即可涵盖 LLM，不要在同级写多个近义词。
+4. **多词概念拆词**：把多词短语拆成单词项并各自加前缀，如 `all:large AND all:language AND all:model`；不要在同级写多个近义词。
 5. **时间范围**：如果用户明确指定时间范围，用 `submittedDate:[开始 TO 结束]` 加入 query；否则不加时间限制。
 6. **字段限定（可选）**：对关键术语用 `all:`，对需要精确匹配的领域用 `ti:` 或 `abs:` 提升准确度。
 7. **只输出 query 字符串本身**，不要加任何前缀、解释、注释或 markdown 格式。不要输出 search_query= 等多余内容。
 
 输出示例：
 用户需求："大规模语言模型在自动驾驶中的决策应用"
-(all:"large language model" AND all:"autonomous driving decision")
+(all:large AND all:language AND all:model AND all:autonomous AND all:driving AND all:decision)
 
 用户需求："大语言模型或者传统机器学习在自动驾驶中的应用"
-((all:"large language model" OR all:"traditional machine learning") AND all:"autonomous driving")
+((all:large AND all:language AND all:model) OR (all:traditional AND all:machine AND all:learning)) AND (all:autonomous AND all:driving)
 
 用户需求："近三年关于Transformer模型在机器翻译中的应用研究"
-(all:"Transformer" AND all:"machine translation") AND submittedDate:[20230101 TO 20251231]
+(all:transformer AND all:machine AND all:translation) AND submittedDate:[20230101 TO 20251231]
 
 用户需求："2023年以来GPT系列模型在自动驾驶感知中的研究"
-(all:"GPT" AND (all:"autonomous driving" OR abs:"self-driving") AND abs:"perception") AND submittedDate:[20230101 TO 20260705]
+(all:gpt AND ((all:autonomous AND all:driving) OR abs:self-driving) AND abs:perception) AND submittedDate:[20230101 TO 20260705]
 """
 
 # ==================== 撰写节点 Prompts ====================

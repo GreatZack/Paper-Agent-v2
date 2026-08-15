@@ -164,6 +164,36 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
 
         return True
 
+    @staticmethod
+    def _sanitize_query(query: str) -> str:
+        """把查询中的引号短语转换为 arXiv API 支持的词项 AND 形式。
+
+        arXiv API 不支持引号短语搜索（带引号的查询永远返回 0 篇），
+        且字段前缀只作用于紧跟其后的第一个词。因此把
+        ``all:"a b c"`` 规范化为 ``all:a AND all:b AND all:c``，
+        并删除任何残留的双引号。
+
+        Args:
+            query: 原始 arXiv 查询表达式（可能含引号短语）。
+
+        Returns:
+            去掉引号、多词短语拆成词项 AND 的查询表达式。
+        """
+        if not query:
+            return query
+
+        def _expand(match: "re.Match[str]") -> str:
+            field, phrase = match.group(1), match.group(2)
+            words = [w for w in re.split(r"\s+", phrase.strip()) if w]
+            if not words:
+                return f"{field}:"
+            return " AND ".join(f"{field}:{w}" for w in words)
+
+        # 处理 field:"phrase" 形式（field 为字母前缀，如 all:/ti:/abs:/au:）
+        sanitized = re.sub(r'([a-zA-Z]+):"([^"]*)"', _expand, query)
+        # 删除任何残留的双引号（裸引号或未配对引号）
+        return sanitized.replace('"', "")
+
     async def process(self, input_data: SearchInput) -> SearchOutput:
         """执行搜索：LLM 生成完整查询表达式 -> 调用 arxiv 搜索 -> 返回结构化结果。
 
@@ -229,15 +259,18 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
         else:
             if not query_keywords:
                 raise ValueError("没有可用的搜索关键词")
-            escaped = [
-                q.replace("\\", "\\\\").replace('"', '\\"') for q in query_keywords
-            ]
-            arxiv_query = "(" + " AND ".join(f'all:"{q}"' for q in escaped) + ")"
+            # arXiv API 不支持引号短语，关键词直接拼为词项（含空格时由
+            # _sanitize_query 统一拆成词项 AND）
+            arxiv_query = "(" + " AND ".join(f"all:{q}" for q in query_keywords) + ")"
             self.logger.info(f"[{self.name}] 关键词拼装查询: {arxiv_query}")
 
         # ── 阶段 3：排序策略 ──
         sort_by = self._sort_criterion(input_data.user_request or "")
         sort_order = arxiv.SortOrder.Descending
+
+        # ── 阶段 3.5：消毒查询（LLM 可能仍生成引号短语，统一转为词项 AND） ──
+        arxiv_query = self._sanitize_query(arxiv_query)
+        self.logger.info(f"[{self.name}] 最终查询: {arxiv_query}")
 
         # ── 阶段 4：执行搜索 ──
         papers = await self.paper_searcher.search_papers(
