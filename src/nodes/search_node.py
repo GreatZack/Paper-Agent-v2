@@ -426,10 +426,18 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
 
             {chr(10).join(lines)}
 
-            请判断每篇论文是否**同时涉及**用户需求中的所有核心概念。
-            只保留严格相关的论文——宁可漏掉边界论文，也不要混入无关的。
+            请判断每篇论文与用户需求的**主题/领域相关性**。判断时看论文的
+            实际研究内容，不要只依赖字面关键词——例如用户搜索"机器学习"时，
+            研究 transformer、神经网络训练的论文同样属于机器学习领域，应保留。
 
-            请只输出一个 JSON 数组，包含严格相关的论文索引，
+            相关性判断标准（满足任一即保留）：
+            - 论文主题直接相关（如专门研究该主题/技术/组织）
+            - 论文属于同一研究领域（如相关技术的应用研究）
+            - 论文涉及用户需求中提到的组织或项目
+
+            宁可多保留，也不要漏掉可能相关的论文。
+
+            请只输出一个 JSON 数组，包含相关的论文索引，
             例如 [0, 3]。如果都不相关输出 []。
             """)
 
@@ -438,7 +446,7 @@ class SearchNode(BaseNode[SearchInput, SearchOutput]):
             model_client = create_model_client()
             filter_agent = _LiteAgent(
                 model_client=model_client,
-                system_message="你是一个论文相关性判断助手。你的任务是根据用户需求判断论文是否严格相关。",
+                system_message="你是一个论文相关性判断助手。你的任务是根据用户需求判断论文是否与需求的主题/领域相关。",
             )
             response = await filter_agent.run(task=prompt)
             content = response.messages[-1].content
@@ -521,9 +529,11 @@ async def search_node(state: State) -> State:
         current_state.search_output = search_output
 
         if search_output.total_count == 0:
-            err_msg = "没有找到相关论文,请尝试其他查询条件"
-            current_state.error.search_node_error = err_msg
-            await _report_status("error", err_msg)
+            # 空结果不标记 error：流程正常结束，由后续节点跳过空输入，
+            # 前端收到提示而非 workflow 失败。
+            await _report_status(
+                "completed", "未找到相关论文，请尝试更换关键词"
+            )
         else:
             await _report_status(
                 "completed", f"搜索完成，共找到 {search_output.total_count} 条结果"

@@ -63,7 +63,7 @@ async def test_search_node_process_without_llm(sample_papers):
     assert output.results[0].paper_id == "2411.11607v2"
     assert output.results[0].pdf_url == "http://arxiv.org/pdf/2411.11607v2"
     node.paper_searcher.search_papers.assert_awaited_once_with(
-        query='(all:"ROS2" AND all:"automated driving")',
+        query='(all:ROS2 AND all:automated driving)',
         max_results=25,
         sort_by=arxiv.SortCriterion.Relevance,
         sort_order=arxiv.SortOrder.Descending,
@@ -91,11 +91,12 @@ async def test_search_node_process_with_llm_generated_query(sample_papers):
         output = await node.process(input_data)
 
     assert output.total_count == 1
-    # 验证 metadata 中记录了 LLM 生成的完整查询
-    assert 'all:"LLM"' in output.metadata["arxiv_query"]
-    assert 'all:"autonomous driving"' in output.metadata["arxiv_query"]
+    # 验证 metadata 中记录了 LLM 生成的完整查询（引号短语已消毒为词项 AND）
+    assert 'all:LLM' in output.metadata["arxiv_query"]
+    assert 'all:autonomous' in output.metadata["arxiv_query"]
+    assert '"' not in output.metadata["arxiv_query"]
     node.paper_searcher.search_papers.assert_awaited_once_with(
-        query='(all:"LLM" AND all:"autonomous driving") AND submittedDate:[20230101 TO 20231231]',
+        query='(all:LLM AND all:autonomous AND all:driving) AND submittedDate:[20230101 TO 20231231]',
         max_results=25,
         sort_by=arxiv.SortCriterion.Relevance,
         sort_order=arxiv.SortOrder.Descending,
@@ -117,7 +118,7 @@ async def test_search_node_with_scope_date_uses_relevance_sort(sample_papers):
     await node.process(input_data)
 
     node.paper_searcher.search_papers.assert_awaited_once_with(
-        query='(all:"LLM")',
+        query='(all:LLM)',
         max_results=25,
         sort_by=arxiv.SortCriterion.Relevance,
         sort_order=arxiv.SortOrder.Descending,
@@ -187,7 +188,7 @@ async def test_search_node_process_llm_retry_success(sample_papers):
         output = await node.process(input_data)
 
     assert output.total_count == 1
-    assert 'all:"LLM"' in output.metadata["arxiv_query"]
+    assert 'all:LLM' in output.metadata["arxiv_query"]
     assert mock_agent.run.await_count == 3  # 前 2 次失败，第 3 次成功
 
 
@@ -241,7 +242,8 @@ async def test_search_node_langgraph_adapter_empty_results():
 
     current = result_state["value"]
     assert current.search_output.total_count == 0
-    assert current.error.search_node_error == "没有找到相关论文,请尝试其他查询条件"
+    # 空结果不标记 error，流程正常结束（后续节点跳过空输入）
+    assert current.error.search_node_error is None
 
 
 @pytest.mark.asyncio
@@ -421,7 +423,7 @@ async def test_search_filters_candidates_before_applying_target_limit(sample_pap
     assert output.metadata["filtered_kept"] == 20
     assert output.metadata["returned_count"] == 1
     node.paper_searcher.search_papers.assert_awaited_once_with(
-        query='(all:"transformer")',
+        query='(all:transformer)',
         max_results=20,
         sort_by=arxiv.SortCriterion.Relevance,
         sort_order=arxiv.SortOrder.Descending,

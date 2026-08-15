@@ -10,6 +10,19 @@ from src.core.model_client import (
 from src.core.openai_client import OpenAICompatClient
 
 
+@pytest.fixture(autouse=True)
+def _clear_model_client_cache():
+    """每个测试前后清空 create_model_client 的 lru_cache。
+
+    create_model_client 带 @lru_cache(maxsize=1)，若前一测试成功创建并缓存
+    了客户端实例，后续"期望缺失配置抛 ValueError"的测试会拿到缓存而不再
+    抛错（DID NOT RAISE）。清空缓存保证测试间隔离。
+    """
+    create_model_client.cache_clear()
+    yield
+    create_model_client.cache_clear()
+
+
 @pytest.fixture
 def valid_model_config():
     return {
